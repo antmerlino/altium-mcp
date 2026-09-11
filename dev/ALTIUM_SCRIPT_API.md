@@ -191,6 +191,32 @@ components where a geometric walk is not:
 Measured on a real project: 855 nets across the flattened document, and on a
 smaller one 97 nets / 114 components of which 23 were unannotated.
 
+### Saving a document
+
+`Client.GetDocumentByPath(path)` returns an `IServerDocument`:
+
+    Doc.Modified            // read and WRITABLE - setting False then
+                            // Client.CloseDocument discards changes cleanly
+    Doc.DoFileSave('')      // verified: Modified goes True -> False and the
+                            // file on disk grows / its mtime updates
+
+Nothing in this repository saved a document before `save_documents`; every
+`SaveToFile` in the .pas units writes a TStringList to a text file, not an
+Altium document. Tools that edit a sheet therefore leave it dirty.
+
+### Annotation and multi-part components
+
+`ISch_Component` exposes `CurrentPartID` (which part this placement shows)
+and `PartCount` (how many parts the symbol has). A multi-part symbol is
+placed as SEPARATE components, one per part, and **their `UniqueId`s differ**
+- measured on a 3-part MCU: `AWIQLVOH`, `ZRYKKRQV`, `WTVLSXNI`. Nothing in
+the object model links them into one physical component, so deciding which
+placements share a designator is a judgement Altium's own annotator makes
+from the user's settings. `annotate_schematic` therefore assigns designators
+only where `PartCount = 1`, and reports the rest.
+
+`Component.Designator.Text` is writable and takes effect immediately.
+
 ### Creating wires
 
 Wires use `eCreate_GlobalCopy`, not `eCreate_Default`, and need their vertices
