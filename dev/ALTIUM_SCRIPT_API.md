@@ -14,17 +14,46 @@ rename to a production sheet:
 
 | Failure | What ran | Recovery |
 |---|---|---|
-| **Compile** error (undeclared identifier, syntax) | **nothing** - the document is untouched | fix and retry, free |
-| **Runtime** error (bad member, bad cast) | everything up to the failing statement, **and it is applied** | check for partial edits first |
+| **Syntax** error (malformed code) | **nothing** - the document is untouched | fix and retry, free |
+| **Undeclared identifier** | everything up to that statement, **and it is applied** | check for partial edits first |
+| **Runtime** error (bad member, bad cast, nil receiver) | same - partial edits stand | check before retrying |
 
-So: put every uncertain identifier in a **throwaway probe script** before it
-goes anywhere near a script that modifies a document. A compile failure costs
-one round trip; a runtime failure halfway through a loop over 33 net labels
-leaves the sheet in a state nobody planned.
+**An undeclared identifier is a RUNTIME failure, not a compile failure.**
+Measured: a script referencing `DM_ErrorCount` logged eight steps, compiled
+and ran, then died at that statement. Only genuinely malformed code
+(`Expression expected but " found`) aborts before anything executes. So a bad
+identifier will happily perform half of your mutation first.
+
+That makes the rule stronger, not weaker: put every uncertain identifier in a
+**throwaway probe script** before it goes anywhere near a script that modifies
+a document.
+
+Two habits that make probing cheap:
+
+- **Order probes least-risky first.** A failure costs you everything after it,
+  nothing before it.
+- **`SandboxLog` the VALUES, not just the step names.** The log is flushed on
+  every call and survives a wedge; `ResultText` is written at the very end and
+  is lost. A probe that logs only "reading component count" tells you nothing
+  when the next line dies; one that logs `components=114` keeps the answer.
 
 The corollary from the main README still holds - put risky reads at the **end**
 of an experiment - but it is weaker than probing separately, because a risky
 read inside a loop is not at the end of anything.
+
+## "Undeclared identifier: X" usually means the RECEIVER IS NIL
+
+This one wastes real time. `DocumentName` is a valid member and is used all
+over this codebase, yet:
+
+    Obj5 := SchServer.GetCurrentSchDocument;   // returns nil - a PCB is focused
+    S2  := Obj5.DocumentName;                  // Error: Undeclared identifier: DocumentName
+
+Late-bound IDispatch cannot resolve a member on nothing, so a nil object is
+reported as a missing *member*. Before concluding an API does not exist, check
+that the object you called it on is non-nil. `GetCurrentSchDocument` returns
+nil whenever the focused document is not a schematic, which happens the moment
+the user clicks another tab.
 
 ## Object IDs
 
@@ -88,6 +117,10 @@ end;
   into type (Boolean)`. Pass it to `SendMessage`; never print it.
 - **`ISch_Component.GetState_PinCount` does not exist.** It kills the script at
   runtime. Count pins by iterating and filtering `ObjectId = ePin`.
+- **`IProject.DM_ErrorCount` does not exist**, and neither does
+  `Client.GetDocumentCount`. There is no DM interface to ERC violations;
+  `check_schematic` derives structural faults from the compiled netlist
+  instead.
 - **The document iterator recurses into components.** A single pass sees
   component pins, parameters and designators as well as sheet-level objects.
   `Obj.Container.ObjectId` identifies the owner - 32 means the sheet itself
@@ -124,6 +157,51 @@ Iterator: `FirstSchObject`, `NextSchObject`.
 `ISch_Wire`: `VerticesCount`, `Vertex[i]` - **1-based**.
 
 `Point(x, y)` is available for building a `TLocation`.
+
+### The compiled netlist (all verified)
+
+This is Altium's own connectivity, correct for mirrored and multi-part
+components where a geometric walk is not:
+
+    Project := GetWorkspace.DM_FocusedProject;
+    Project.DM_Compile;                     // no return value to check
+    Flat := Project.DM_DocumentFlattened;   // nil if the compile produced nothing
+    Flat.DM_NetCount / DM_Nets(i)           // INet
+    Net.DM_NetName / DM_PinCount / DM_Pins(i)
+    Pin.DM_PinNumber / DM_LogicalPartDesignator / DM_FlattenedNetName
+    Flat.DM_ComponentCount / DM_Components(i)
+    Comp.DM_PhysicalDesignator / DM_LogicalDesignator / DM_PinCount
+    Comp.DM_OwnerDocumentName
+
+Measured on a real project: 855 nets across the flattened document, and on a
+smaller one 97 nets / 114 components of which 23 were unannotated.
+
+### Creating wires
+
+Wires use `eCreate_GlobalCopy`, not `eCreate_Default`, and need their vertices
+inserted one at a time (1-based):
+
+```pascal
+Obj := SchServer.SchObjectFactory(eWire, eCreate_GlobalCopy);
+Obj.Location := Point(x1, y1);
+Obj.InsertVertex := 1;  Obj.SetState_Vertex(1, Point(x1, y1));
+Obj.InsertVertex := 2;  Obj.SetState_Vertex(2, Point(x2, y2));
+Doc.RegisterSchObjectInContainer(Obj);
+SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+                                   SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+```
+
+### Placing a library component
+
+`Component.Replicate` onto the target sheet. Both obvious alternatives are
+dead ends that return without error and place nothing - see
+[`DBLIB_FINDINGS.md`](DBLIB_FINDINGS.md):
+
+- `IntegratedLibraryManager.PlaceLibraryComponent(...)`
+- process `Sch:PlaceIntegratedComponentFromDB`
+
+`ISch_Component.DatabaseLibraryName` / `.DatabaseTableName` are **not
+writable** - assigning to them kills the script. `.DesignItemID` is writable.
 
 ## Modifying a document
 
