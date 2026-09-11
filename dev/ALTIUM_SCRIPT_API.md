@@ -121,6 +121,21 @@ end;
   `Client.GetDocumentCount`. There is no DM interface to ERC violations;
   `check_schematic` derives structural faults from the compiled netlist
   instead.
+- **`SchLibIterator_Destroy` does not exist.** `SchLibIterator_Create` pairs
+  with plain `SchIterator_Destroy`. Calling the symmetric-looking name kills
+  the script in the `finally` block, after the useful work has completed.
+- **`GetWorkspace.DM_CreateNewDocument('SCH')` fails** with "Could not convert
+  variant of type (OleStr) into type (Double)" on AD21, despite being recorded
+  as verified in `DBLIB_FINDINGS.md`. To get a scratch sheet, copy an existing
+  `.SchDoc` to a new path and `Client.OpenDocument('SCH', path)` it - that
+  works, and closing with `Modified := False` then `Client.CloseDocument`
+  leaves nothing behind.
+- **A replicated component's pins keep LIBRARY-RELATIVE coordinates.** For a
+  normally placed part, `Pin.Location` is absolute (component location plus
+  the library offset). For one created with `Component.Replicate`, pins report
+  the raw library offset - measured: component at (20000000, 50000000), its
+  pin 8 at (2000000, 0). Re-assigning `Component.Location` after registration
+  does not fix it. Any wire routed to those coordinates misses.
 - **The document iterator recurses into components.** A single pass sees
   component pins, parameters and designators as well as sheet-level objects.
   `Obj.Container.ObjectId` identifies the owner - 32 means the sheet itself
