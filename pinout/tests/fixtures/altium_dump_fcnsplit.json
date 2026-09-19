@@ -1,0 +1,416 @@
+{
+ "library_name": "scratch_fake.SchLib",
+ "symbol_name": "EMBEDDED_IC_FAKE32C20U6_FCNSPLIT",
+ "description": "EMBEDDED IC MCU UFQFPN20",
+ "part_count": 2,
+ "primitives": [
+  {
+   "type": "rectangle",
+   "x1": 300,
+   "y1": -300,
+   "x2": 2400,
+   "y2": 100,
+   "line_width": 1,
+   "is_solid": true,
+   "owner_part_id": 2
+  },
+  {
+   "type": "pin",
+   "pin_number": "19",
+   "pin_name": "NRST",
+   "electrical": 0,
+   "orientation": 2,
+   "x": 300,
+   "y": 0,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 2
+  },
+  {
+   "type": "pin",
+   "pin_number": "17",
+   "pin_name": "PF0-OSC_IN",
+   "electrical": 1,
+   "orientation": 2,
+   "x": 300,
+   "y": -100,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 2
+  },
+  {
+   "type": "pin",
+   "pin_number": "18",
+   "pin_name": "PF1-OSC_OUT",
+   "electrical": 1,
+   "orientation": 2,
+   "x": 300,
+   "y": -200,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 2
+  },
+  {
+   "type": "pin",
+   "pin_number": "1",
+   "pin_name": "VDD",
+   "electrical": 7,
+   "orientation": 0,
+   "x": 2400,
+   "y": 0,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 2
+  },
+  {
+   "type": "pin",
+   "pin_number": "20",
+   "pin_name": "VDDA",
+   "electrical": 7,
+   "orientation": 0,
+   "x": 2400,
+   "y": -100,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 2
+  },
+  {
+   "type": "pin",
+   "pin_number": "10",
+   "pin_name": "VSS",
+   "electrical": 4,
+   "orientation": 0,
+   "x": 2400,
+   "y": -200,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 2
+  },
+  {
+   "type": "label",
+   "text": "ADC1",
+   "x": 700,
+   "y": 0,
+   "owner_part_id": 1
+  },
+  {
+   "type": "line",
+   "x1": 300,
+   "y1": -200,
+   "x2": 1300,
+   "y2": -200,
+   "line_width": 1,
+   "owner_part_id": 1
+  },
+  {
+   "type": "label",
+   "text": "GPIO",
+   "x": 2000,
+   "y": 0,
+   "owner_part_id": 1
+  },
+  {
+   "type": "line",
+   "x1": 1300,
+   "y1": -300,
+   "x2": 2400,
+   "y2": -300,
+   "line_width": 1,
+   "owner_part_id": 1
+  },
+  {
+   "type": "label",
+   "text": "I2C1",
+   "x": 700,
+   "y": -300,
+   "owner_part_id": 1
+  },
+  {
+   "type": "line",
+   "x1": 300,
+   "y1": -600,
+   "x2": 1300,
+   "y2": -600,
+   "line_width": 1,
+   "owner_part_id": 1
+  },
+  {
+   "type": "label",
+   "text": "SPI1",
+   "x": 2000,
+   "y": -400,
+   "owner_part_id": 1
+  },
+  {
+   "type": "line",
+   "x1": 1300,
+   "y1": -800,
+   "x2": 2400,
+   "y2": -800,
+   "line_width": 1,
+   "owner_part_id": 1
+  },
+  {
+   "type": "label",
+   "text": "SWD",
+   "x": 700,
+   "y": -700,
+   "owner_part_id": 1
+  },
+  {
+   "type": "line",
+   "x1": 300,
+   "y1": -1000,
+   "x2": 1300,
+   "y2": -1000,
+   "line_width": 1,
+   "owner_part_id": 1
+  },
+  {
+   "type": "label",
+   "text": "USART2",
+   "x": 2000,
+   "y": -900,
+   "owner_part_id": 1
+  },
+  {
+   "type": "line",
+   "x1": 1300,
+   "y1": -1200,
+   "x2": 2400,
+   "y2": -1200,
+   "line_width": 1,
+   "owner_part_id": 1
+  },
+  {
+   "type": "label",
+   "text": "UNUSED",
+   "x": 700,
+   "y": -1100,
+   "owner_part_id": 1
+  },
+  {
+   "type": "line",
+   "x1": 300,
+   "y1": -1400,
+   "x2": 1300,
+   "y2": -1400,
+   "line_width": 1,
+   "owner_part_id": 1
+  },
+  {
+   "type": "rectangle",
+   "x1": 300,
+   "y1": -1500,
+   "x2": 2400,
+   "y2": 100,
+   "line_width": 1,
+   "is_solid": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "polyline",
+   "line_width": 1,
+   "vertices": [
+    {
+     "x": 1300,
+     "y": 100
+    },
+    {
+     "x": 1300,
+     "y": -1500
+    }
+   ],
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "2",
+   "pin_name": "PA0",
+   "electrical": 0,
+   "orientation": 2,
+   "x": 300,
+   "y": -100,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "6",
+   "pin_name": "PA4",
+   "electrical": 2,
+   "orientation": 0,
+   "x": 2400,
+   "y": -100,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "11",
+   "pin_name": "PB0",
+   "electrical": 2,
+   "orientation": 0,
+   "x": 2400,
+   "y": -200,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "13",
+   "pin_name": "PB6",
+   "electrical": 1,
+   "orientation": 2,
+   "x": 300,
+   "y": -400,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "14",
+   "pin_name": "PB7",
+   "electrical": 1,
+   "orientation": 2,
+   "x": 300,
+   "y": -500,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "7",
+   "pin_name": "PA5",
+   "electrical": 2,
+   "orientation": 0,
+   "x": 2400,
+   "y": -500,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "8",
+   "pin_name": "PA6",
+   "electrical": 0,
+   "orientation": 0,
+   "x": 2400,
+   "y": -600,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "9",
+   "pin_name": "PA7",
+   "electrical": 2,
+   "orientation": 0,
+   "x": 2400,
+   "y": -700,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "15",
+   "pin_name": "PA13 (JTMS/SWDIO)",
+   "electrical": 1,
+   "orientation": 2,
+   "x": 300,
+   "y": -800,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "16",
+   "pin_name": "PA14 (JTCK/SWCLK)",
+   "electrical": 1,
+   "orientation": 2,
+   "x": 300,
+   "y": -900,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "4",
+   "pin_name": "PA2",
+   "electrical": 2,
+   "orientation": 0,
+   "x": 2400,
+   "y": -1000,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "5",
+   "pin_name": "PA3",
+   "electrical": 0,
+   "orientation": 0,
+   "x": 2400,
+   "y": -1100,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "3",
+   "pin_name": "PA1",
+   "electrical": 1,
+   "orientation": 2,
+   "x": 300,
+   "y": -1200,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  },
+  {
+   "type": "pin",
+   "pin_number": "12",
+   "pin_name": "PB1",
+   "electrical": 1,
+   "orientation": 2,
+   "x": 300,
+   "y": -1300,
+   "length": 300,
+   "show_name": true,
+   "show_designator": true,
+   "owner_part_id": 1
+  }
+ ],
+ "_provenance": "real get_symbol_primitives output from AD Develop for a symbol generated from tests/fixtures/fake_board.ioc; synthetic part, no user data"
+}

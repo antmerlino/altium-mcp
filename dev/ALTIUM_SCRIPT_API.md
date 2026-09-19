@@ -191,6 +191,42 @@ components where a geometric walk is not:
 Measured on a real project: 855 nets across the flattened document, and on a
 smaller one 97 nets / 114 components of which 23 were unannotated.
 
+### A path is a STRING to Altium - spell it exactly one way
+
+`Client.IsDocumentOpen(path)` and `Client.GetDocumentByPath(path)` compare the
+path text. A forward-slash spelling of a document that is open under
+backslashes is "not open", so `Client.OpenDocument` loads a **second instance
+of the same file from disk**. Measured: `scratch_fake.SchLib` open twice at
+once - `C:\Users\...` holding two freshly created symbols, `C:/Users/...`
+holding only the on-disk `Component_1` - and every API reporting success
+throughout. Symptoms: "symbol not found" right after a successful create, a
+library inventory that looks stale, edits that vanish.
+
+Always pass the canonical Windows path (absolute, backslashes) exactly as
+Altium reports `DocumentName`. The Python side does this in `_canon()` for
+every path-taking tool. `SchServer.GetSchDocumentByPath(path)` (verified) is
+how to reach an open library's `ISch_Document` by path without focusing it.
+
+### Creating a library (verified on AD Develop)
+
+```pascal
+Doc := Client.OpenNewDocument('SCHLIB', 'name.SchLib', 'description', False);
+Client.ShowDocument(Doc);
+Doc.DoSafeChangeFileNameAndSave('C:\path\name.SchLib', 'SCHLIB');  // no dialog
+```
+
+Dead ends, so they are not retried: `GetWorkspace.DM_CreateNewDocument('SCH')`
+fails with an OleStr/Double conversion error; the process
+`WorkspaceManager:OpenObject` with `ObjectKind=Document|DocumentKind=SCHLIB`
+opens a "Choose Document to Open" **file chooser** - it means open-existing,
+not new. A new library arrives with Altium's default empty `Component_1`.
+
+Adding a component to a library: `SchObjectFactory(eSchComponent,
+eCreate_Default)`, `AddSchObject` each pin, then `Lib.AddSchComponent(Comp)`.
+Verified iterable immediately afterwards on AD Develop (the
+`SCHM_PrimitiveRegistration` message with a nil first argument, as the
+shipped code sends, is harmless but was not what made it appear).
+
 ### Saving a document
 
 `Client.GetDocumentByPath(path)` returns an `IServerDocument`:
