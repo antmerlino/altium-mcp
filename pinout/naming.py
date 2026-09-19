@@ -62,9 +62,15 @@ INPUT_HINTS = ("_RX", "_MISO", "ADC", "COMP", "GPIO_Input", "EXTI", "_IN", "_CTS
 
 
 def base_pin(name: str) -> str:
-    """PF0-OSC_IN -> PF0; PC2_C -> PC2; VDD -> VDD."""
+    """PF0-OSC_IN -> PF0; "PA13 (JTMS/SWDIO)" -> PA13; VDD -> VDD.
+
+    PC2_C stays PC2_C: on the H7 the _C pad is a separate ball (the direct
+    ADC path) that exists alongside PC2, so it is its own pin, not a spelling."""
     m = PORT_PIN.match(name)
-    return m.group(1) if m else name
+    if not m:
+        return name
+    rest = name[len(m.group(1)):]
+    return m.group(1) + ("_C" if rest.upper().startswith("_C") and len(rest.rstrip()) == 2 else "")
 
 
 def port_of(name: str) -> Optional[str]:

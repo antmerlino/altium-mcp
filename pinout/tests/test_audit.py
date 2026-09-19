@@ -238,7 +238,9 @@ class AuditDetectsTest(unittest.TestCase):
     def test_h7_pin_names_resolve_to_ports(self):
         self.assertEqual(naming.base_pin("PA13 (JTMS/SWDIO)"), "PA13")
         self.assertEqual(naming.port_of("PA13 (JTMS/SWDIO)"), "PA")
-        self.assertEqual(naming.base_pin("PC2_C"), "PC2")
+        self.assertEqual(naming.base_pin("PC2_C"), "PC2_C", "a separate ball on the H7, not a spelling of PC2")
+        self.assertEqual(naming.port_of("PC2_C"), "PC")
+        self.assertEqual(naming.base_pin("PA0_C"), "PA0_C")
         self.assertEqual(naming.base_pin("PH0-OSC_IN (PH0)"), "PH0")
         self.assertTrue(naming.is_port_pin("PC14-OSC32_IN (OSC32_IN)"))
         self.assertFalse(naming.is_port_pin("VDD"))
