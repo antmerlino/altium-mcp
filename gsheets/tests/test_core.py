@@ -71,6 +71,7 @@ class AddressingTest(unittest.TestCase):
 
     def test_open(self):
         o = self.s.open(URL)
+        self.assertTrue(o["success"])
         self.assertEqual(o["spreadsheet"], "Flight Computer Pinning")
         self.assertEqual(o["linked_tab"], "Pins")
         pins = next(t for t in o["tabs"] if t["title"] == "Pins")

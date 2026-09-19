@@ -349,7 +349,7 @@ class Sheets:
     def open(self, spreadsheet: str, header_preview: bool = True) -> dict:
         meta = self.meta(spreadsheet, refresh=True)
         sid, url_gid = self.resolve(spreadsheet)
-        out = meta.summary()
+        out = {"success": True, **meta.summary()}
         if header_preview and meta.tabs:
             ranges = [a1.Ref(t.title, 1, 1, min(10, t.rows), min(30, t.cols)).a1() for t in meta.tabs if t.rows and t.cols]
             got = self.backend.get_values(sid, ranges, "formatted") if ranges else []
