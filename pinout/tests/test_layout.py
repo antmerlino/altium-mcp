@@ -186,6 +186,8 @@ class PreviewTest(unittest.TestCase):
     def test_png_per_part_is_a_real_image(self):
         from PIL import Image
         from pinout.preview import write_pngs
+        from pinout.style import Style
+        st = Style()      # defaults ARE Altium stock, so this is the expected render
         spec = functional_split(build(), mpn="FAKE32C20U6")
         with tempfile.TemporaryDirectory() as d:
             files = write_pngs(spec, d)
@@ -196,14 +198,31 @@ class PreviewTest(unittest.TestCase):
                     self.assertGreater(im.width * im.height, 10000)
                     # not a blank canvas: the body fill and ink must both appear
                     colours = {c for _, c in im.getcolors(maxcolors=100000) or []}
-                    self.assertIn((255, 246, 200), colours, "body fill missing")
-                    self.assertIn((26, 26, 26), colours, "pin ink missing")
+                    self.assertIn(st.rgb("body_fill"), colours, "body fill missing")
+                    self.assertIn(st.rgb("pin_color"), colours, "pin ink missing")
             # part 1 carries group labels; their ink must survive the body fill.
             # (Drawing in spec order painted the rectangle last and hid them -
             # a bug the preview found in its own output.)
             with Image.open(files[0]) as im:
                 colours = {c for _, c in im.getcolors(maxcolors=100000) or []}
-                self.assertIn((31, 78, 154), colours, "group labels painted over")
+                self.assertIn(st.rgb("label_color"), colours, "group labels painted over")
+
+    @unittest.skipUnless(__import__("importlib").util.find_spec("PIL"), "Pillow not installed")
+    def test_a_house_style_changes_every_colour_in_the_render(self):
+        # the preview must show what the house palette will look like, not
+        # Altium's stock yellow/blue - otherwise it previews the wrong thing
+        from PIL import Image
+        from pinout.style import Style
+        from pinout.preview import write_pngs
+        house = Style(body_fill="2B2B2B", body_line="E0E0E0", pin_color="FF8800", label_color="00CCFF")
+        spec = functional_split(build(), mpn="FAKE32C20U6")
+        with tempfile.TemporaryDirectory() as d:
+            f = write_pngs(spec, d, style=house)[0]
+            with Image.open(f) as im:
+                colours = {c for _, c in im.getcolors(maxcolors=100000) or []}
+        for field in ("body_fill", "body_line", "pin_color", "label_color"):
+            self.assertIn(house.rgb(field), colours, field)
+        self.assertNotIn(Style().rgb("body_fill"), colours, "stock yellow must be gone")
 
     def test_svg_paints_body_before_labels_and_lines(self):
         spec = functional_split(build(), mpn="FAKE32C20U6")

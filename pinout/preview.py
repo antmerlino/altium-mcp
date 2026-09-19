@@ -9,9 +9,10 @@ just flips it).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from .layout import SymbolSpec, parse_pin_spec
+from .style import Style
 
 SCALE = 0.3          # px per mil
 MARGIN = 400         # mils around the drawing
@@ -36,7 +37,8 @@ def _in_draw_order(gfx):
     return sorted(gfx, key=lambda g: _DRAW_ORDER.get(g[0], 3))
 
 
-def render_part_svg(spec: SymbolSpec, part: int) -> str:
+def render_part_svg(spec: SymbolSpec, part: int, style: Optional[Style] = None) -> str:
+    style = style or Style()
     pins = [parse_pin_spec(p) for p in spec.pins]
     pins = [p for p in pins if p["part"] == part]
     gfx = [g.split("|") for g in spec.graphics if int(g.split("|")[1]) == part]
@@ -78,24 +80,24 @@ def render_part_svg(spec: SymbolSpec, part: int) -> str:
             ax, ay, bx, by = map(int, g[4:8])
             out.append(f'<rect x="{X(min(ax,bx)):.1f}" y="{Y(max(ay,by)):.1f}" '
                        f'width="{abs(bx-ax)*SCALE:.1f}" height="{abs(by-ay)*SCALE:.1f}" '
-                       f'fill="#fff6c8" stroke="#7a1f1f" stroke-width="1.2"/>')
+                       f'fill="#{style.body_fill}" stroke="#{style.body_line}" stroke-width="1.2"/>')
         elif kind == "line":
             ax, ay, bx, by = map(int, g[3:7])
             out.append(f'<line x1="{X(ax):.1f}" y1="{Y(ay):.1f}" x2="{X(bx):.1f}" y2="{Y(by):.1f}" '
-                       f'stroke="#7a1f1f" stroke-width="1.2"/>')
+                       f'stroke="#{style.body_line}" stroke-width="1.2"/>')
         elif kind == "polyline":
             vals = list(map(int, g[3:]))
             pts = " ".join(f"{X(vals[i]):.1f},{Y(vals[i+1]):.1f}" for i in range(0, len(vals), 2))
-            out.append(f'<polyline points="{pts}" fill="none" stroke="#7a1f1f" stroke-width="1"/>')
+            out.append(f'<polyline points="{pts}" fill="none" stroke="#{style.body_line}" stroke-width="1"/>')
         elif kind == "label":
-            out.append(f'<text x="{X(int(g[2])):.1f}" y="{Y(int(g[3])):.1f}" fill="#1f4e9a" '
+            out.append(f'<text x="{X(int(g[2])):.1f}" y="{Y(int(g[3])):.1f}" fill="#{style.label_color}" '
                        f'font-weight="bold">{_esc(g[4])}</text>')
 
     for p in pins:
         left = p["orientation"] == "eRotate180"
         far = p["x"] - p["length"] if left else p["x"] + p["length"]
         out.append(f'<line x1="{X(p["x"]):.1f}" y1="{Y(p["y"]):.1f}" x2="{X(far):.1f}" '
-                   f'y2="{Y(p["y"]):.1f}" stroke="#1a1a1a" stroke-width="1.4"/>')
+                   f'y2="{Y(p["y"]):.1f}" stroke="#{style.pin_color}" stroke-width="1.4"/>')
         # pin number just outside the tip, pin name just inside the body
         num_x = X(far) + (-4 if left else 4)
         out.append(f'<text x="{num_x:.1f}" y="{Y(p["y"]) - 2:.1f}" '
@@ -111,13 +113,13 @@ def _safe_name(spec: SymbolSpec) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in spec.name)
 
 
-def write_svgs(spec: SymbolSpec, out_dir) -> List[Path]:
+def write_svgs(spec: SymbolSpec, out_dir, style: Optional[Style] = None) -> List[Path]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for part in range(1, spec.part_count + 1):
         p = out_dir / f"{_safe_name(spec)}_part{part}.svg"
-        p.write_text(render_part_svg(spec, part), encoding="utf-8")
+        p.write_text(render_part_svg(spec, part, style), encoding="utf-8")
         paths.append(p)
     return paths
 
@@ -128,7 +130,9 @@ def write_svgs(spec: SymbolSpec, out_dir) -> List[Path]:
 # and a human's image viewer both open without a browser, so this is the form
 # a preview is actually LOOKED at in.
 
-def render_part_png(spec: SymbolSpec, part: int, path, scale: float = 0.3) -> Path:
+def render_part_png(spec: SymbolSpec, part: int, path, scale: float = 0.3,
+                    style: Optional[Style] = None) -> Path:
+    style = style or Style()
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError as e:
@@ -170,12 +174,12 @@ def render_part_png(spec: SymbolSpec, part: int, path, scale: float = 0.3) -> Pa
 
     d.text((6, 4), f"{spec.name}  -  part {part} of {spec.part_count}  ({len(pins)} pins)",
            fill="black", font=title)
-    body, ink, lab = (122, 31, 31), (26, 26, 26), (31, 78, 154)
+    body, ink, lab = style.rgb("body_line"), style.rgb("pin_color"), style.rgb("label_color")
     for g in _in_draw_order(gfx):
         if g[0] == "rectangle":
             ax, ay, bx, by = map(int, g[4:8])
             d.rectangle([X(min(ax, bx)), Y(max(ay, by)), X(max(ax, bx)), Y(min(ay, by))],
-                        fill=(255, 246, 200), outline=body, width=2)
+                        fill=style.rgb("body_fill"), outline=body, width=2)
         elif g[0] == "line":
             ax, ay, bx, by = map(int, g[3:7])
             d.line([X(ax), Y(ay), X(bx), Y(by)], fill=body, width=2)
@@ -201,7 +205,8 @@ def render_part_png(spec: SymbolSpec, part: int, path, scale: float = 0.3) -> Pa
     return path
 
 
-def write_pngs(spec: SymbolSpec, out_dir, scale: float = 0.3) -> List[Path]:
+def write_pngs(spec: SymbolSpec, out_dir, scale: float = 0.3,
+               style: Optional[Style] = None) -> List[Path]:
     out_dir = Path(out_dir)
-    return [render_part_png(spec, part, out_dir / f"{_safe_name(spec)}_part{part}.png", scale)
+    return [render_part_png(spec, part, out_dir / f"{_safe_name(spec)}_part{part}.png", scale, style)
             for part in range(1, spec.part_count + 1)]

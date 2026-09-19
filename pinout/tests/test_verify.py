@@ -1,5 +1,6 @@
 """verify: a spec compared against what Altium reports back."""
 import copy
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -132,6 +133,55 @@ class DetectsDifferencesTest(unittest.TestCase):
         self.assertFalse(r["match"])
         self.assertEqual(len(r["pins"]["missing_in_altium"]), 20)
         self.assertEqual(r["summary"]["altium_pins"], 0)
+
+
+class StyleCheckTest(unittest.TestCase):
+    """Appearance is checked separately from geometry: the shipped creator
+    paints Altium's stock yellow/blue whatever the house library looks like."""
+
+    def test_bgr_round_trip_matches_altium_stock_constants(self):
+        from pinout.style import hex_to_bgr, bgr_to_hex, Style
+        # the two constants hard-coded in schematic_utils.pas
+        self.assertEqual(hex_to_bgr("FFFFB0"), 0x00B0FFFF)
+        self.assertEqual(hex_to_bgr("0000FF"), 0x00FF0000)
+        self.assertEqual(bgr_to_hex(0x00B0FFFF), "FFFFB0")
+        self.assertEqual(Style().bgr("body_fill"), 0x00B0FFFF, "default Style IS Altium stock")
+
+    def test_styled_synthetic_dump_passes_check_style(self):
+        from pinout.style import Style
+        from pinout.verify import check_style
+        st = Style(body_fill="2B2B2B", body_line="E0E0E0", pin_color="FF8800", label_color="00CCFF")
+        s = spec()
+        r = check_style(spec_as_dump(s, st), st)
+        self.assertTrue(r["colours_reported"])
+        self.assertTrue(r["match"], r["mismatches"][:3])
+        self.assertGreater(r["checked"], 30)
+        # and geometry comparison is unaffected by colours being present
+        self.assertTrue(compare(s, spec_as_dump(s, st))["match"])
+
+    def test_wrong_body_fill_is_pinpointed_in_hex(self):
+        from pinout.style import Style, hex_to_bgr
+        from pinout.verify import check_style
+        st = Style()
+        d = spec_as_dump(spec(), st)
+        rect = next(p for p in d["primitives"] if p["type"] == "rectangle")
+        rect["area_color"] = hex_to_bgr("123456")
+        r = check_style(d, st)
+        self.assertFalse(r["match"])
+        self.assertEqual(len(r["mismatches"]), 1)
+        m = r["mismatches"][0]
+        self.assertEqual((m["kind"], m["field"], m["expected"], m["actual"]),
+                         ("rectangle", "body_fill", "FFFFB0", "123456"))
+
+    def test_old_dump_without_colours_is_reported_not_failed(self):
+        from pinout.style import Style
+        from pinout.verify import check_style
+        r = check_style(spec_as_dump(spec()), Style())          # no style -> no colour fields
+        self.assertFalse(r["colours_reported"])
+        self.assertIsNone(r["match"])
+        # the real Altium fixtures predate colour reporting - same outcome
+        golden = json.loads((FIX / "altium_dump_fcnsplit.json").read_text(encoding="utf-8"))
+        self.assertFalse(check_style(golden, Style())["colours_reported"])
 
 
 if __name__ == "__main__":

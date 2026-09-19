@@ -20,9 +20,10 @@ The dump shape (measured on AD Develop):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .layout import SymbolSpec, parse_pin_spec
+from .style import Style, bgr_to_hex, hex_to_bgr
 
 ELECTRICAL = {"eElectricInput": 0, "eElectricIO": 1, "eElectricOutput": 2,
               "eElectricOpenCollector": 3, "eElectricPassive": 4, "eElectricHiZ": 5,
@@ -49,33 +50,40 @@ class Normalized:
                 | {("label",) + l for l in self.labels})
 
 
-def spec_as_dump(spec: SymbolSpec) -> dict:
+def spec_as_dump(spec: SymbolSpec, style: Optional[Style] = None) -> dict:
     """Synthesise the get_symbol_primitives shape from a spec - what Altium
-    SHOULD return if it applied the spec faithfully."""
+    SHOULD return if it applied the spec faithfully. With a Style, the
+    colour fields the dump now reports are filled in too."""
     prims: List[dict] = []
     for raw in spec.pins:
         p = parse_pin_spec(raw)
         prims.append({"type": "pin", "pin_number": p["number"], "pin_name": p["name"],
                       "electrical": ELECTRICAL[p["type"]], "orientation": ORIENT[p["orientation"]],
                       "x": p["x"], "y": p["y"], "length": p["length"],
-                      "owner_part_id": p["part"], "show_name": True, "show_designator": True})
+                      "owner_part_id": p["part"], "show_name": True, "show_designator": True,
+                      **({"color": style.bgr("pin_color")} if style else {})})
     for raw in spec.graphics:
         f = raw.split("|")
         part = int(f[1])
         if f[0] == "rectangle":
             prims.append({"type": "rectangle", "x1": int(f[4]), "y1": int(f[5]), "x2": int(f[6]),
                           "y2": int(f[7]), "line_width": int(f[2]), "is_solid": f[3] == "1",
-                          "owner_part_id": part})
+                          "owner_part_id": part,
+                          **({"color": style.bgr("body_line"),
+                              "area_color": style.bgr("body_fill")} if style else {})})
         elif f[0] == "line":
             prims.append({"type": "line", "x1": int(f[3]), "y1": int(f[4]), "x2": int(f[5]),
-                          "y2": int(f[6]), "line_width": int(f[2]), "owner_part_id": part})
+                          "y2": int(f[6]), "line_width": int(f[2]), "owner_part_id": part,
+                          **({"color": style.bgr("body_line")} if style else {})})
         elif f[0] == "polyline":
             v = list(map(int, f[3:]))
             prims.append({"type": "polyline", "line_width": int(f[2]), "owner_part_id": part,
-                          "vertices": [{"x": v[i], "y": v[i + 1]} for i in range(0, len(v), 2)]})
+                          "vertices": [{"x": v[i], "y": v[i + 1]} for i in range(0, len(v), 2)],
+                          **({"color": style.bgr("body_line")} if style else {})})
         elif f[0] == "label":
             prims.append({"type": "label", "text": f[4], "x": int(f[2]), "y": int(f[3]),
-                          "owner_part_id": part})
+                          "owner_part_id": part,
+                          **({"color": style.bgr("label_color")} if style else {})})
     return {"symbol_name": spec.name, "description": spec.description,
             "part_count": spec.part_count, "primitives": prims}
 
@@ -157,3 +165,52 @@ def compare(spec: SymbolSpec, dump: dict) -> dict:
                     "spec_graphics": len(want.graphics), "altium_graphics": len(have.graphics),
                     "graphics_identical": len(want.graphics & have.graphics)},
     }
+
+
+# ---- appearance ----------------------------------------------------------------
+
+_BODY_FILLED = ("rectangle", "polygon", "ellipse")
+_BODY_STROKE = ("line", "polyline", "arc", "elliptical_arc")
+
+
+def check_style(dump: dict, style: Style) -> dict:
+    """Does every primitive carry the Style's colours and width?
+
+    Geometry can match perfectly while the symbol looks nothing like the house
+    library - the shipped creator paints Altium's stock yellow/blue - so
+    appearance is checked separately from compare(). Dumps made before the
+    dump reported colours have no colour fields; that is reported, not failed.
+    """
+    prims = dump.get("primitives", [])
+    if not any("color" in p for p in prims):
+        return {"colours_reported": False, "match": None, "checked": 0, "mismatches": [],
+                "note": "this dump carries no colour fields - re-dump with a current server"}
+    want = {"body_line": style.bgr("body_line"), "body_fill": style.bgr("body_fill"),
+            "pin": style.bgr("pin_color"), "label": style.bgr("label_color")}
+    mism, checked = [], 0
+
+    def expect(p, field, key, exp):
+        nonlocal checked
+        if key in p:
+            checked += 1
+            if int(p[key]) != exp:
+                mism.append({"kind": p["type"], "part": p.get("owner_part_id"), "field": field,
+                             "expected": bgr_to_hex(exp), "actual": bgr_to_hex(int(p[key]))})
+
+    for p in prims:
+        k = p.get("type")
+        if k in _BODY_FILLED:
+            expect(p, "body_line", "color", want["body_line"])
+            expect(p, "body_fill", "area_color", want["body_fill"])
+            if "line_width" in p and int(p["line_width"]) != style.line_width:
+                checked += 1
+                mism.append({"kind": k, "part": p.get("owner_part_id"), "field": "line_width",
+                             "expected": style.line_width, "actual": int(p["line_width"])})
+        elif k in _BODY_STROKE:
+            expect(p, "body_line", "color", want["body_line"])
+        elif k == "pin":
+            expect(p, "pin_color", "color", want["pin"])
+        elif k == "label":
+            expect(p, "label_color", "color", want["label"])
+    return {"colours_reported": True, "match": not mism, "checked": checked,
+            "mismatches": mism, "style": style.to_dict()}
