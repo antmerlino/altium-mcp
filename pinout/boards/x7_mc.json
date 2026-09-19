@@ -1,0 +1,40 @@
+{
+  "name": "X7 Mission Computer",
+  "prefix": "MC",
+  "ioc": "X:/Shared drives/Verge Engineering/Hardware/X7/X7 Engineering/Electrical/STM32CubeMX Projects/Mission Computer/STM32H753XIHx/STM32H753XIHx.ioc",
+  "mcu_xml": "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeMX/db/mcu/STM32H753XIHx.xml",
+  "debug_style": "SWD_SWDIO",
+  "sheet": {
+    "workbook": "10yheqbnWWiD-3o4rZhj-hsOaMiHpOUIMgp1tx3RffZQ",
+    "review_tab": "Reconcile",
+    "pins": {
+      "tab": "Schematic View",
+      "header_row": 1,
+      "key": "Fully Qualified Pin Name",
+      "columns": {"net": "Control Board Net Name"}
+    },
+    "signals": {
+      "tab": "Signal Definitions",
+      "header_row": 1,
+      "key": "Assigned Pin",
+      "columns": {
+        "peripheral": "Peripheral",
+        "peripheral_pin": "Peripheral Pin",
+        "direction": "Direction",
+        "other_end": "Who's on the other end of the line?",
+        "postfix": "Postfix",
+        "net_generated": "Generated Net Name",
+        "net_override": "Override",
+        "net": "Net Name",
+        "power_domain": "Power Domain",
+        "software_name": "Software Name"
+      }
+    }
+  },
+  "altium": {
+    "project_dir": "D:/Altium/X2 Control Board",
+    "symbol": "EMBEDDED_IC_STM32H753XIH6_X2_CB",
+    "sheets": ["MC_STM32H753XIHx_Comms", "MC_STM32H753XIHx_PwrRst", "MissionComputer"],
+    "library": "D:/Altium/VergeLibrary/Libraries/VergeLibrary.SchLib"
+  }
+}

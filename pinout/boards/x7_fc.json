@@ -1,0 +1,45 @@
+{
+  "name": "X7 Flight Computer",
+  "prefix": "FC",
+  "ioc": "X:/Shared drives/Verge Engineering/Hardware/X7/X7 Engineering/Electrical/STM32CubeMX Projects/Flight Computer/Flight Computer.ioc",
+  "mcu_xml": "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeMX/db/mcu/STM32H753IIKx.xml",
+  "debug_style": "SWDIO",
+  "sheet": {
+    "workbook": "1QDLfB9z8z13GyIRlZ8aJGhlmNW_zDawdt9jtClgl9HU",
+    "review_tab": "Reconcile",
+    "pins": {
+      "tab": "Pin Definitions",
+      "header_row": 3,
+      "key": "Pin name (function after reset)",
+      "columns": {
+        "ball": "UFBGA176+25",
+        "group": "CubeMX Peripheral",
+        "signal": "CubeMX Peripheral Function",
+        "cube_label": "CubeMX Label",
+        "label_override": "Label Override",
+        "net": "Net Name",
+        "notes": "Notes",
+        "checked": "Checked"
+      }
+    }
+  },
+  "altium": {
+    "project_dir": "D:/Altium/X2 Control Board",
+    "symbol": "EMBEDDED_IC_STM32H753IIK6_X2_CB",
+    "sheets": [
+      "FC_STM32H753IIKx_Comms",
+      "FC_STM32H753IIKx_PwrRst",
+      "FlightComputer"
+    ],
+    "library": "D:/Altium/VergeLibrary/Libraries/VergeLibrary.SchLib"
+  },
+  "options": {
+    "broken_views": [
+      {
+        "tab": "Signals by Port",
+        "column": "Net Name",
+        "note": "#REF! in every row; the real net names are in Pin Definitions"
+      }
+    ]
+  }
+}

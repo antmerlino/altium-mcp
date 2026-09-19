@@ -324,11 +324,17 @@ class MemoryBackend:
                     t["title"] = p["title"]
                 if "hidden" in fields:
                     t["hidden"] = bool(p.get("hidden"))
+                if "frozenRowCount" in fields:
+                    t["frozen_rows"] = int(p.get("gridProperties", {}).get("frozenRowCount", 0))
                 if "index" in fields:
                     others = sorted((o for o in book["tabs"] if o is not t), key=lambda o: o["index"])
                     others.insert(min(int(p["index"]), len(others)), t)
                     for i, o in enumerate(others):
                         o["index"] = i
+                replies.append({})
+            elif kind == "setDataValidation":
+                t = self._tab(sid, gid=body["range"]["sheetId"])
+                t.setdefault("validations", []).append(body)
                 replies.append({})
             elif kind == "appendDimension":
                 t = self._tab(sid, gid=body["sheetId"])
