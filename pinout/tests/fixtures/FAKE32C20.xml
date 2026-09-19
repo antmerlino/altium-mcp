@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SYNTHETIC test fixture. Mirrors the CubeMX db/mcu/*.xml schema (default
+     namespace, <Pin Name Position Type> with <Signal Name/> children) for an
+     invented 20-pin MCU. Not a real part; not derived from any user file. -->
+<Mcu ClockTree="FAKE32" DBVersion="V3.0" Family="FAKE32" HasPowerPad="false" IOType=""
+     Line="FAKE32x2" Package="UFQFPN20" RefName="FAKE32C20Ux"
+     xmlns="http://mcd.rou.st.com/modules.php?name=mcu">
+    <Core>Arm Cortex-M4</Core>
+    <Frequency>170</Frequency>
+    <IP InstanceName="ADC1" Name="ADC" Version="adc1_v1"/>
+    <IP InstanceName="I2C1" Name="I2C" Version="i2c_v1"/>
+    <IP InstanceName="RCC" Name="RCC" Version="rcc_v1"/>
+    <IP InstanceName="SPI1" Name="SPI" Version="spi_v1"/>
+    <IP InstanceName="SYS" Name="SYS" Version="sys_v1"/>
+    <IP InstanceName="USART2" Name="USART" Version="usart_v1"/>
+    <Pin Name="VDD" Position="1" Type="Power"/>
+    <Pin Name="PA0" Position="2" Type="I/O">
+        <Signal Name="ADC1_IN1"/>
+        <Signal Name="TIM2_CH1"/>
+        <Signal Name="USART2_CTS"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA1" Position="3" Type="I/O">
+        <Signal Name="ADC1_IN2"/>
+        <Signal Name="TIM2_CH2"/>
+        <Signal Name="USART2_RTS"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA2" Position="4" Type="I/O">
+        <Signal Name="ADC1_IN3"/>
+        <Signal Name="TIM2_CH3"/>
+        <Signal Name="USART2_TX"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA3" Position="5" Type="I/O">
+        <Signal Name="ADC1_IN4"/>
+        <Signal Name="TIM2_CH4"/>
+        <Signal Name="USART2_RX"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA4" Position="6" Type="I/O">
+        <Signal Name="DAC1_OUT1"/>
+        <Signal Name="SPI1_NSS"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA5" Position="7" Type="I/O">
+        <Signal Name="DAC1_OUT2"/>
+        <Signal Name="SPI1_SCK"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA6" Position="8" Type="I/O">
+        <Signal Name="SPI1_MISO"/>
+        <Signal Name="TIM3_CH1"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA7" Position="9" Type="I/O">
+        <Signal Name="SPI1_MOSI"/>
+        <Signal Name="TIM3_CH2"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="VSS" Position="10" Type="Power"/>
+    <Pin Name="PB0" Position="11" Type="I/O">
+        <Signal Name="ADC1_IN8"/>
+        <Signal Name="TIM3_CH3"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PB1" Position="12" Type="I/O">
+        <Signal Name="ADC1_IN9"/>
+        <Signal Name="TIM3_CH4"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PB6" Position="13" Type="I/O">
+        <Signal Name="I2C1_SCL"/>
+        <Signal Name="USART1_TX"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PB7" Position="14" Type="I/O">
+        <Signal Name="I2C1_SDA"/>
+        <Signal Name="USART1_RX"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA13" Position="15" Type="I/O">
+        <Signal Name="SYS_JTMS-SWDIO"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PA14" Position="16" Type="I/O">
+        <Signal Name="SYS_JTCK-SWCLK"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PF0-OSC_IN" Position="17" Type="I/O">
+        <Signal Name="RCC_OSC_IN"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="PF1-OSC_OUT" Position="18" Type="I/O">
+        <Signal Name="RCC_OSC_OUT"/>
+        <Signal IOModes="Input,Output,Analog,EVENTOUT,EXTI" Name="GPIO"/>
+    </Pin>
+    <Pin Name="NRST" Position="19" Type="Reset"/>
+    <Pin Name="VDDA" Position="20" Type="Power"/>
+</Mcu>
