@@ -86,7 +86,9 @@ class ModifyTest(unittest.TestCase):
         self.assertEqual(len(listed), 16)
         self.assertIn("PB1", listed)
         self.assertEqual(listed[-1], "VP_SYS_VS_Systick", "virtual pins stay last")
-        self.assertEqual(listed[:2], ["PA0", "PA13"], "physical pins first, sorted")
+        self.assertEqual(listed[:2], ["PA0", "PA13"], "existing order is preserved")
+        self.assertEqual(listed[-2], "PB1", "a new physical pin is appended before the virtual ones; "
+                                             "CubeMX re-sorts by ball position on its next save")
 
     def test_new_keys_are_inserted_sorted(self):
         self.ioc.set_pin("PA1", signal="TIM2_CH2")
@@ -123,6 +125,90 @@ class ModifyTest(unittest.TestCase):
     def test_invalid_pin_name_rejected(self):
         with self.assertRaises(ValueError):
             self.ioc.set_pin("Mcu", signal="X")
+
+
+H7_SNIPPET = "\n".join([
+    "#MicroXplorer Configuration settings - do not modify",
+    "Mcu.Name=STM32H753IIKx",
+    "Mcu.Package=UFBGA176",
+    "Mcu.Pin0=PE3",
+    "Mcu.Pin1=PA13 (JTMS/SWDIO)",
+    "Mcu.Pin2=PH0-OSC_IN (PH0)",
+    "Mcu.Pin3=PC2_C",
+    "Mcu.Pin4=VP_SYS_VS_Systick",
+    "Mcu.PinsNb=5",
+    "PA13\\ (JTMS/SWDIO).Mode=Serial_Wire",
+    "PA13\\ (JTMS/SWDIO).Signal=DEBUG_JTMS-SWDIO",
+    "PC2_C.GPIOParameters=GPIO_Label",
+    "PC2_C.GPIO_Label=OBS1_3V3_SENSE",
+    "PC2_C.Signal=ADCx_INP12",
+    "PE3.Signal=GPIO_Output",
+    "PH0-OSC_IN\\ (PH0).Mode=HSE-External-Oscillator",
+    "PH0-OSC_IN\\ (PH0).Signal=RCC_OSC_IN",
+    "SPI1.Mode=Full_Duplex_Master",
+    "VP_SYS_VS_Systick.Mode=SysTick",
+    "VP_SYS_VS_Systick.Signal=SYS_VS_Systick",
+    "",
+])
+
+
+class RealWorldKeyFormsTest(unittest.TestCase):
+    """The spellings CubeMX actually writes for H7 parts, none of which the
+    first parser saw: a space inside a key is written as backslash-space
+    (Java .properties), direct-ADC pads are PC2_C, oscillator pins carry a
+    parenthesised annotation. Silently dropping these pins is the worst
+    failure mode, so every form is pinned down here."""
+
+    def setUp(self):
+        self.ioc = IocFile(H7_SNIPPET)
+
+    def test_escaped_keys_are_read_unescaped(self):
+        pins = self.ioc.pins()
+        self.assertEqual(sorted(pins), ["PA13 (JTMS/SWDIO)", "PC2_C", "PE3", "PH0-OSC_IN (PH0)"])
+        self.assertEqual(pins["PA13 (JTMS/SWDIO)"].signal, "DEBUG_JTMS-SWDIO")
+        self.assertEqual(pins["PA13 (JTMS/SWDIO)"].mode, "Serial_Wire")
+        self.assertEqual(pins["PH0-OSC_IN (PH0)"].signal, "RCC_OSC_IN")
+        self.assertEqual(pins["PC2_C"].label, "OBS1_3V3_SENSE")
+        self.assertEqual(self.ioc.get("PA13 (JTMS/SWDIO).Signal"), "DEBUG_JTMS-SWDIO")
+
+    def test_peripheral_mode_keys_are_not_pins(self):
+        self.assertNotIn("SPI1", self.ioc.pins(include_virtual=True))
+
+    def test_pin_name_forms(self):
+        for name in ("PA13 (JTMS/SWDIO)", "PH0-OSC_IN (PH0)", "PC14-OSC32_IN (OSC32_IN)",
+                     "PC2_C", "PA0_C", "PB4 (NJTRST)", "PF0-OSC_IN", "PG10-nRST", "PB8-BOOT0"):
+            self.assertTrue(is_physical_pin(name), name)
+        for name in ("PA13 (JTMS/SWDIO", "PA13(JTMS)", "SPI1", "VP_SYS_VS_Systick", "PA 13"):
+            self.assertFalse(is_physical_pin(name), name)
+
+    def test_writing_an_escaped_key_reproduces_cubemx_spelling(self):
+        self.ioc.set_pin("PA13 (JTMS/SWDIO)", mode="JTAG_5_pins")
+        self.assertIn("PA13\\ (JTMS/SWDIO).Mode=JTAG_5_pins", self.ioc.text().split("\n"))
+        self.ioc.set_pin("PC14-OSC32_IN (OSC32_IN)", signal="RCC_OSC32_IN")
+        lines = self.ioc.text().split("\n")
+        self.assertIn("PC14-OSC32_IN\\ (OSC32_IN).Signal=RCC_OSC32_IN", lines)
+        # inserted sorted among the other pin keys, escaped form on disk
+        self.assertLess(lines.index("PC14-OSC32_IN\\ (OSC32_IN).Signal=RCC_OSC32_IN"),
+                        lines.index("PC2_C.GPIOParameters=GPIO_Label"))
+
+    def test_rewriting_same_values_is_byte_identical(self):
+        self.ioc.set_pin("PA13 (JTMS/SWDIO)", signal="DEBUG_JTMS-SWDIO", mode="Serial_Wire")
+        self.ioc.set_pin("PH0-OSC_IN (PH0)", signal="RCC_OSC_IN")
+        self.assertEqual(self.ioc.text(), H7_SNIPPET)
+
+    def test_pin_list_keeps_cubemx_position_order(self):
+        # PE3 before PA13: CubeMX orders by ball position, not alphabetically
+        self.assertEqual(self.ioc.pin_list(),
+                         ["PE3", "PA13 (JTMS/SWDIO)", "PH0-OSC_IN (PH0)", "PC2_C", "VP_SYS_VS_Systick"])
+        self.ioc.set_pin("PB0", signal="TIM3_CH3")
+        self.assertEqual(self.ioc.pin_list(),
+                         ["PE3", "PA13 (JTMS/SWDIO)", "PH0-OSC_IN (PH0)", "PC2_C", "PB0",
+                          "VP_SYS_VS_Systick"])
+        self.assertEqual(self.ioc.get("Mcu.PinsNb"), "6")
+        self.ioc.clear_pin("PH0-OSC_IN (PH0)")
+        self.assertEqual(self.ioc.pin_list(),
+                         ["PE3", "PA13 (JTMS/SWDIO)", "PC2_C", "PB0", "VP_SYS_VS_Systick"])
+        self.assertNotIn("PH0-OSC_IN\\ (PH0).Signal=RCC_OSC_IN", self.ioc.text().split("\n"))
 
 
 if __name__ == "__main__":

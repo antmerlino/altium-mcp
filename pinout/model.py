@@ -57,6 +57,17 @@ class PinRecord:
         return self.function or self.label
 
 
+def function_from_label(label: Optional[str]) -> Optional[str]:
+    """The house GPIO_Label convention is <role>__<Function>, for example
+    USART2_RX__BB_ESC_TX or SPI2_DRDY1__SE1: the part after the double
+    underscore is the designer's name for what the pin does. It seeds the
+    designer-owned `function` column (and so the net label) when the .ioc
+    carries it; an explicit override still wins in merge_overrides."""
+    if label and "__" in label:
+        return label.split("__", 1)[1] or None
+    return None
+
+
 @dataclass
 class Pinout:
     mcu: str
@@ -78,7 +89,8 @@ class Pinout:
                 number=p.position, name=p.name, port=naming.port_of(p.name),
                 mcu_type=p.type, signals=list(p.signals),
                 signal=a.signal if a else None, mode=a.mode if a else None,
-                label=a.label if a else None, locked=a.locked if a else False))
+                label=a.label if a else None, locked=a.locked if a else False,
+                function=function_from_label(a.label) if a else None))
         if ioc:
             unknown = sorted(set(assigned) - {p.name for p in mcu.pins})
             if unknown:

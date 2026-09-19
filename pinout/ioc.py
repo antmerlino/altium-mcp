@@ -18,9 +18,35 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-PHYSICAL_PIN = re.compile(r"^P[A-K]\d{1,2}(?:-[A-Za-z0-9_+\-]+)?$")
+# PA0, PB12, PF0-OSC_IN, PG10-nRST, PC2_C (an H7 direct-ADC pad) and the H7
+# debug/oscillator pins whose CubeMX name carries an annotation in
+# parentheses: "PA13 (JTMS/SWDIO)", "PH0-OSC_IN (PH0)", "PC14-OSC32_IN (OSC32_IN)".
+PHYSICAL_PIN = re.compile(r"^P[A-K]\d{1,2}(?:[-_][A-Za-z0-9_+\-]+)?(?: \([^()]*\))?$")
 VIRTUAL_PREFIX = "VP_"
-PIN_KEY = re.compile(r"^([^.=\s]+)\.(Signal|Mode|GPIO_Label|Locked|GPIOParameters)$")
+PIN_KEY = re.compile(r"^([^.]+)\.(Signal|Mode|GPIO_Label|Locked|GPIOParameters)$")
+
+# An .ioc is a Java .properties file: a space, '=', ':' or backslash inside a
+# KEY is written with a backslash in front of it, so the pin above appears as
+#     PA13\ (JTMS/SWDIO).Signal=DEBUG_JTMS-SWDIO
+# Values are never escaped. Keys are compared and reported UNESCAPED
+# everywhere in this module; the escaping exists only on the line in the file.
+_KEY_ESCAPES = {" ": "\\ ", "=": "\\=", ":": "\\:", "\\": "\\\\"}
+
+
+def escape_key(key: str) -> str:
+    return "".join(_KEY_ESCAPES.get(c, c) for c in key)
+
+
+def unescape_key(raw: str) -> str:
+    out, i = [], 0
+    while i < len(raw):
+        if raw[i] == "\\" and i + 1 < len(raw):
+            out.append(raw[i + 1])
+            i += 2
+        else:
+            out.append(raw[i])
+            i += 1
+    return "".join(out)
 
 
 def is_physical_pin(name: str) -> bool:
@@ -64,12 +90,28 @@ class IocFile:
     # ---- key/value level -------------------------------------------------
     @staticmethod
     def _split(line: str):
-        if not line or line.startswith("#") or "=" not in line:
+        """(key, value) for a `key=value` line, key unescaped; None otherwise.
+
+        The separator is the first '=' that is not itself escaped. A raw,
+        unescaped space in the key means this is not a key CubeMX wrote (in
+        .properties it would terminate the key), so the line is left alone.
+        """
+        if not line or line[0] in "#!":
             return None
-        key, _, value = line.partition("=")
-        if " " in key:
+        i, n = 0, len(line)
+        while i < n:
+            c = line[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c == "=":
+                break
+            if c == " ":
+                return None
+            i += 1
+        else:
             return None
-        return key, value
+        return unescape_key(line[:i]), line[i + 1:]
 
     def _index_of(self, key: str) -> int:
         for i, line in enumerate(self._lines):
@@ -90,7 +132,7 @@ class IocFile:
         diff rather than a reshuffle.
         """
         i = self._index_of(key)
-        line = f"{key}={value}"
+        line = f"{escape_key(key)}={value}"
         if i >= 0:
             self._lines[i] = line
             return
@@ -196,17 +238,34 @@ class IocFile:
         else:
             self.delete(key)
 
+    def pin_list(self) -> List[str]:
+        """Mcu.Pin0..N in INDEX order (the file string-sorts the keys, so
+        Mcu.Pin9 sits after Mcu.Pin89 on disk)."""
+        indexed = []
+        for key in self.keys("Mcu.Pin"):
+            suffix = key[len("Mcu.Pin"):]
+            if suffix.isdigit():
+                indexed.append((int(suffix), self.get(key)))
+        return [name for _, name in sorted(indexed)]
+
     def _sync_pin_list(self) -> None:
         """Rebuild Mcu.Pin0..N and Mcu.PinsNb from the pins carrying a Signal.
 
-        CubeMX counts virtual pins here too, so they are kept. Physical pins
-        are listed first, sorted, then virtual ones.
+        CubeMX lists physical pins in package-position order (ball A1, A2,
+        ... then B1 ...) and virtual pins after them. This module has no
+        package data, so it keeps the existing order for pins that stay
+        assigned, drops the ones that lost their signal, and appends newly
+        assigned pins - physical ones just before the first virtual pin,
+        virtual ones at the end. CubeMX re-sorts on its next save; until
+        then the diff is minimal.
         """
         assigned = self.pins(include_virtual=True)
-        names = [p for p, a in assigned.items() if a.signal]
-        physical = sorted(p for p in names if is_physical_pin(p))
-        virtual = sorted(p for p in names if is_virtual_pin(p))
-        ordered = physical + virtual
+        names = {p for p, a in assigned.items() if a.signal}
+        kept = [p for p in self.pin_list() if p in names]
+        new_physical = sorted(p for p in names - set(kept) if is_physical_pin(p))
+        new_virtual = sorted(p for p in names - set(kept) if is_virtual_pin(p))
+        first_virtual = next((i for i, p in enumerate(kept) if is_virtual_pin(p)), len(kept))
+        ordered = kept[:first_virtual] + new_physical + kept[first_virtual:] + new_virtual
         for key in self.keys("Mcu.Pin"):
             if re.match(r"^Mcu\.Pin\d+$", key):
                 self.delete(key)

@@ -19,16 +19,40 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-PORT_PIN = re.compile(r"^(P([A-K])(\d{1,2}))(?:[-_].*)?$")
+# PA13, PF0-OSC_IN, PC2_C, "PA13 (JTMS/SWDIO)" (H7 CubeMX names carry the
+# debug/oscillator annotation after a space).
+PORT_PIN = re.compile(r"^(P([A-K])(\d{1,2}))(?:[-_ ].*)?$")
 
-# Signal prefixes that are not peripherals in the grouping sense.
+# Signal prefixes that are not peripherals in the grouping sense. G4-series
+# CubeMX calls the debug port SYS_*, H7-series calls it DEBUG_*.
 _SPECIAL_GROUPS = {
     "SYS_JTMS-SWDIO": "SWD", "SYS_JTCK-SWCLK": "SWD", "SYS_JTDO-SWO": "SWD",
     "SYS_JTDI": "SWD", "SYS_JTRST": "SWD", "SYS_WKUP": "SYS",
+    "DEBUG_JTMS-SWDIO": "SWD", "DEBUG_JTCK-SWCLK": "SWD", "DEBUG_JTDO-SWO": "SWD",
+    "DEBUG_JTDI": "SWD", "DEBUG_JTRST": "SWD",
 }
 _DEBUG_ALIASES = {
     "SYS_JTMS-SWDIO": "JTMS/SWDIO", "SYS_JTCK-SWCLK": "JTCK/SWCLK",
     "SYS_JTDO-SWO": "JTDO/SWO", "SYS_JTDI": "JTDI", "SYS_JTRST": "nJTRST",
+    "DEBUG_JTMS-SWDIO": "JTMS/SWDIO", "DEBUG_JTCK-SWCLK": "JTCK/SWCLK",
+    "DEBUG_JTDO-SWO": "JTDO/SWO", "DEBUG_JTDI": "JTDI", "DEBUG_JTRST": "nJTRST",
+}
+# Peripheral names that are more than one underscore token.
+_MULTI_TOKEN_HEADS = ("USB_OTG_HS", "USB_OTG_FS")
+
+# What a hand-drawn symbol may call a group versus what CubeMX calls the
+# peripheral. Both sides go through canonical_group() before being compared.
+GROUP_ALIASES = {
+    "QSPI": "QUADSPI", "OSPI": "OCTOSPI",
+    "OTGFS": "USB_OTG_FS", "OTG_FS": "USB_OTG_FS", "USBFS": "USB_OTG_FS", "USB_FS": "USB_OTG_FS",
+    "OTGHS": "USB_OTG_HS", "OTG_HS": "USB_OTG_HS", "USBHS": "USB_OTG_HS", "USB_HS": "USB_OTG_HS",
+    "ULPI": "USB_OTG_HS", "OTG_ULPI": "USB_OTG_HS", "OTGULPI": "USB_OTG_HS",
+    "OTG_HS_ULPI": "USB_OTG_HS", "USB_ULPI": "USB_OTG_HS",
+    "JTAG": "SWD", "DEBUG": "SWD", "SWD/JTAG": "SWD", "JTAG/SWD": "SWD",
+    "ADCX": "ADC", "ADC1/2": "ADC", "ADC1/ADC2": "ADC",
+    "OSC": "RCC", "CLOCK": "RCC", "XTAL": "RCC",
+    "CAN1": "FDCAN1", "CAN2": "FDCAN2", "CAN3": "FDCAN3",
+    "SDIO": "SDMMC1", "ETHERNET": "ETH", "RMII": "ETH", "MII": "ETH",
 }
 
 OUTPUT_HINTS = ("_TX", "_SCK", "_MOSI", "_NSS", "_CH", "GPIO_Output", "DAC", "_OUT",
@@ -63,11 +87,32 @@ def peripheral_group(signal: Optional[str]) -> Optional[str]:
         return "GPIO"
     if signal.startswith("RCC_"):
         return "RCC"
+    if signal.startswith("DEBUG_TRACE"):
+        return "TRACE"
+    if signal.startswith("DEBUG_"):
+        return "SWD"
+    if signal.startswith("ADCx_"):          # an input shared by ADC1 and ADC2
+        return "ADC"
+    for h in _MULTI_TOKEN_HEADS:
+        if signal.startswith(h + "_"):
+            return h
     head = signal.split("_", 1)[0]
     # S_TIM3_CH1 (a shared-timer signal in some .ioc files) -> TIM3
     if head == "S" and "_" in signal:
         head = signal.split("_", 2)[1]
     return head
+
+
+def canonical_group(text: Optional[str]) -> Optional[str]:
+    """Normalise a group label or peripheral name for comparison:
+    'QSPI' and 'QUADSPI' are the same thing, so are 'OTGFS' and 'USB_OTG_FS'."""
+    if not text:
+        return None
+    t = text.strip().upper().replace(" ", "")
+    t = GROUP_ALIASES.get(t, t)
+    # designers write UART4 for USART4 and vice versa; no MCU has both with
+    # the same index, so the distinction carries no information
+    return re.sub(r"^USART(\d+)$", r"UART\1", t)
 
 
 def display_name(pin_name: str, signal: Optional[str] = None, style: str = "plain") -> str:
