@@ -215,5 +215,37 @@ class StyleCheckTest(unittest.TestCase):
         self.assertFalse(check_style(golden, Style())["colours_reported"])
 
 
+class HouseStyledGoldenDumpsTest(unittest.TestCase):
+    """Real AD Develop dumps of the two fake symbols AFTER apply_symbol_style
+    painted the house palette (2026-09-19): geometry must still equal the
+    spec that created them and every colour field must be the house one."""
+
+    def _spec(self, strategy, board):
+        from pinout.layout import port_split
+        p = Pinout.from_sources(load_mcu_xml(FIX / "FAKE32C20.xml"),
+                                IocFile.load(FIX / "fake_board.ioc"))
+        fn = functional_split if strategy == "fcn" else port_split
+        return fn(p, pin_length=300, mpn="FAKE32C20U6", board=board)
+
+    def test_both_symbols_geometry_and_palette(self):
+        from pinout.style import Style
+        from pinout.verify import check_style
+        house = Style.load(Path(__file__).resolve().parents[1] / "house_style.json")
+        for strategy, board, fixture, n_gfx in (("fcn", "FCNSPLIT", "altium_dump_fcnsplit_house.json", 17),
+                                                ("port", "PORTSPLIT", "altium_dump_portsplit_house.json", 7)):
+            with self.subTest(board):
+                dump = json.loads((FIX / fixture).read_text(encoding="utf-8"))
+                g = compare(self._spec(strategy, board), dump)
+                self.assertTrue(g["match"], g)
+                self.assertEqual((g["summary"]["pins_identical"], g["summary"]["graphics_identical"]),
+                                 (20, n_gfx))
+                s = check_style(dump, house)
+                self.assertTrue(s["colours_reported"])
+                self.assertTrue(s["match"], s["mismatches"][:3])
+                self.assertGreater(s["checked"], 25)
+                # and the stock palette is now rejected for these dumps
+                self.assertFalse(check_style(dump, Style())["match"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
