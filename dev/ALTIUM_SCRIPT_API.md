@@ -152,6 +152,19 @@ end;
   part a pin belongs to and `Component.CurrentPartID` says which part that
   placement displays. Coordinates of pins from other parts are meaningless.
 
+### The MCP layer turns an all-digit string argument into an int
+
+`mcp` 1.5.0 (`FuncMetadata.pre_parse_json`) tries `json.loads` on every string
+argument and keeps the result unless it is itself a string. So a tool
+declared `body_line: str` receives the hex colour `"800000"` as the **integer
+800000**, while `"FFFFFF"` (not JSON) and `"000000"` (a leading zero is
+invalid JSON) arrive intact. Pydantic then rejects the int with
+`Input should be a valid string`, and the caller sees nothing but a validation
+error. Any parameter whose legitimate values can be all digits (hex colours,
+pin numbers, designator suffixes) must be typed `Union[str, int]` and
+normalised, reading the int's decimal digits back verbatim and zero-padding
+(`_hex6` in main.py). Measured 2026-09-19 on `apply_symbol_style`.
+
 ## Members verified working
 
 `SchServer`: `GetCurrentSchDocument`, `SchObjectFactory(kind, eCreate_Default)`,
