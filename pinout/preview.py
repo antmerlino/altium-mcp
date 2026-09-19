@@ -23,6 +23,19 @@ def _esc(s: str) -> str:
              .replace('"', "&quot;"))
 
 
+_DRAW_ORDER = {"rectangle": 0, "polyline": 1, "line": 1, "label": 2}
+
+
+def _in_draw_order(gfx):
+    """Filled bodies first, then strokes, then text - so nothing is painted over.
+
+    Specs list graphics in construction order (a group's label and separator
+    before the part's body rectangle), and a filled rectangle drawn last
+    hides everything under it. The previewer caught this on its own output.
+    """
+    return sorted(gfx, key=lambda g: _DRAW_ORDER.get(g[0], 3))
+
+
 def render_part_svg(spec: SymbolSpec, part: int) -> str:
     pins = [parse_pin_spec(p) for p in spec.pins]
     pins = [p for p in pins if p["part"] == part]
@@ -59,7 +72,7 @@ def render_part_svg(spec: SymbolSpec, part: int) -> str:
            f'<text x="6" y="{FONT + 4}" font-size="{FONT + 3}">{_esc(spec.name)}  -  part {part} '
            f'of {spec.part_count}  ({len(pins)} pins)</text>']
 
-    for g in gfx:
+    for g in _in_draw_order(gfx):
         kind = g[0]
         if kind == "rectangle":
             ax, ay, bx, by = map(int, g[4:8])
@@ -94,13 +107,101 @@ def render_part_svg(spec: SymbolSpec, part: int) -> str:
     return "\n".join(out)
 
 
+def _safe_name(spec: SymbolSpec) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in spec.name)
+
+
 def write_svgs(spec: SymbolSpec, out_dir) -> List[Path]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in spec.name)
     paths = []
     for part in range(1, spec.part_count + 1):
-        p = out_dir / f"{safe}_part{part}.svg"
+        p = out_dir / f"{_safe_name(spec)}_part{part}.svg"
         p.write_text(render_part_svg(spec, part), encoding="utf-8")
         paths.append(p)
     return paths
+
+
+# ---- PNG (optional, needs Pillow) ------------------------------------------
+#
+# Same geometry as the SVG, rasterised. A PNG is what an agent's image reader
+# and a human's image viewer both open without a browser, so this is the form
+# a preview is actually LOOKED at in.
+
+def render_part_png(spec: SymbolSpec, part: int, path, scale: float = 0.3) -> Path:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as e:
+        raise RuntimeError("PNG preview needs Pillow (pip install pillow)") from e
+
+    pins = [p for p in map(parse_pin_spec, spec.pins) if p["part"] == part]
+    gfx = [g.split("|") for g in spec.graphics if int(g.split("|")[1]) == part]
+
+    xs, ys = [], []
+    for p in pins:
+        far = p["x"] - p["length"] if p["orientation"] == "eRotate180" else p["x"] + p["length"]
+        xs += [p["x"], far]; ys.append(p["y"])
+    for g in gfx:
+        if g[0] == "rectangle":
+            xs += [int(g[4]), int(g[6])]; ys += [int(g[5]), int(g[7])]
+        elif g[0] == "line":
+            xs += [int(g[3]), int(g[5])]; ys += [int(g[4]), int(g[6])]
+        elif g[0] == "polyline":
+            v = list(map(int, g[3:])); xs += v[0::2]; ys += v[1::2]
+        elif g[0] == "label":
+            xs.append(int(g[2])); ys.append(int(g[3]))
+    if not xs:
+        xs, ys = [0, 1000], [0, -1000]
+    x0, x1 = min(xs) - MARGIN, max(xs) + MARGIN
+    y0, y1 = min(ys) - MARGIN, max(ys) + MARGIN
+
+    def X(v): return (v - x0) * scale
+    def Y(v): return (y1 - v) * scale
+
+    W, H = int((x1 - x0) * scale) + 1, int((y1 - y0) * scale) + 1
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("consola.ttf", 12)
+        bold = ImageFont.truetype("consolab.ttf", 12)
+        title = ImageFont.truetype("consola.ttf", 14)
+    except OSError:
+        font = bold = title = ImageFont.load_default()
+
+    d.text((6, 4), f"{spec.name}  -  part {part} of {spec.part_count}  ({len(pins)} pins)",
+           fill="black", font=title)
+    body, ink, lab = (122, 31, 31), (26, 26, 26), (31, 78, 154)
+    for g in _in_draw_order(gfx):
+        if g[0] == "rectangle":
+            ax, ay, bx, by = map(int, g[4:8])
+            d.rectangle([X(min(ax, bx)), Y(max(ay, by)), X(max(ax, bx)), Y(min(ay, by))],
+                        fill=(255, 246, 200), outline=body, width=2)
+        elif g[0] == "line":
+            ax, ay, bx, by = map(int, g[3:7])
+            d.line([X(ax), Y(ay), X(bx), Y(by)], fill=body, width=2)
+        elif g[0] == "polyline":
+            v = list(map(int, g[3:]))
+            d.line([(X(v[i]), Y(v[i + 1])) for i in range(0, len(v), 2)], fill=body, width=1)
+        elif g[0] == "label":
+            d.text((X(int(g[2])), Y(int(g[3])) - 12), g[4], fill=lab, font=bold)
+    for p in pins:
+        left = p["orientation"] == "eRotate180"
+        far = p["x"] - p["length"] if left else p["x"] + p["length"]
+        d.line([X(p["x"]), Y(p["y"]), X(far), Y(p["y"])], fill=ink, width=2)
+        num_w = d.textlength(p["number"], font=font)
+        d.text((X(far) - num_w - 4 if left else X(far) + 4, Y(p["y"]) - 13),
+               p["number"], fill=(68, 68, 68), font=font)
+        name_w = d.textlength(p["name"], font=font)
+        d.text((X(p["x"]) + 6 if left else X(p["x"]) - name_w - 6, Y(p["y"]) - 7),
+               p["name"], fill=ink, font=font)
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(str(path))
+    return path
+
+
+def write_pngs(spec: SymbolSpec, out_dir, scale: float = 0.3) -> List[Path]:
+    out_dir = Path(out_dir)
+    return [render_part_png(spec, part, out_dir / f"{_safe_name(spec)}_part{part}.png", scale)
+            for part in range(1, spec.part_count + 1)]

@@ -182,6 +182,38 @@ class PreviewTest(unittest.TestCase):
             self.assertEqual(len(files), spec.part_count)
             self.assertTrue(all(f.exists() and f.stat().st_size > 500 for f in files))
 
+    @unittest.skipUnless(__import__("importlib").util.find_spec("PIL"), "Pillow not installed")
+    def test_png_per_part_is_a_real_image(self):
+        from PIL import Image
+        from pinout.preview import write_pngs
+        spec = functional_split(build(), mpn="FAKE32C20U6")
+        with tempfile.TemporaryDirectory() as d:
+            files = write_pngs(spec, d)
+            self.assertEqual(len(files), spec.part_count)
+            for f in files:
+                with Image.open(f) as im:
+                    self.assertEqual(im.format, "PNG")
+                    self.assertGreater(im.width * im.height, 10000)
+                    # not a blank canvas: the body fill and ink must both appear
+                    colours = {c for _, c in im.getcolors(maxcolors=100000) or []}
+                    self.assertIn((255, 246, 200), colours, "body fill missing")
+                    self.assertIn((26, 26, 26), colours, "pin ink missing")
+            # part 1 carries group labels; their ink must survive the body fill.
+            # (Drawing in spec order painted the rectangle last and hid them -
+            # a bug the preview found in its own output.)
+            with Image.open(files[0]) as im:
+                colours = {c for _, c in im.getcolors(maxcolors=100000) or []}
+                self.assertIn((31, 78, 154), colours, "group labels painted over")
+
+    def test_svg_paints_body_before_labels_and_lines(self):
+        spec = functional_split(build(), mpn="FAKE32C20U6")
+        svg = render_part_svg(spec, 1)
+        first_rect = svg.index("<rect x=")            # the body (the page rect has no x=)
+        first_label = svg.index('font-weight="bold"')
+        first_line = svg.index("<line x1=")
+        self.assertLess(first_rect, first_label, "label would be hidden under the body")
+        self.assertLess(first_rect, first_line, "separator would be hidden under the body")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
