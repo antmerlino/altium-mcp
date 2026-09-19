@@ -1,0 +1,9 @@
+{
+ "body_fill": "FFFFFF",
+ "body_line": "800000",
+ "divider_color": "980000",
+ "pin_color": "000000",
+ "label_color": "980000",
+ "line_width": 1,
+ "_provenance": "Read on 2026-09-19 from EMBEDDED_IC_STM32H753IIK6_X57 in Libraries/VergeLibrary.SchLib via get_symbol_primitives with the user's permission: 3 rectangles outline 800000 fill FFFFFF (width 1, one at 0), 9 polylines 980000 width 1, 24 labels 980000 font 1, 201 pins 000000. Colours are RRGGBB; Altium stores them as $00BBGGRR."
+}

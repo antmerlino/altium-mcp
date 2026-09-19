@@ -41,15 +41,33 @@ def hex_to_rgb(h: str) -> Tuple[int, int, int]:
 class Style:
     body_fill: str = "FFFFB0"     # Altium stock: light yellow  ($00B0FFFF)
     body_line: str = "0000FF"     # Altium stock: blue           ($00FF0000)
+    divider_color: str = ""       # lines/polylines/arcs; "" = same as body_line
     pin_color: str = "000000"
     label_color: str = "0000FF"
     line_width: int = 1           # Altium eSmall
 
+    def colour(self, field: str) -> str:
+        """Resolve a colour field; divider_color falls back to body_line."""
+        v = getattr(self, field)
+        return v if v else self.body_line
+
     def rgb(self, field: str) -> Tuple[int, int, int]:
-        return hex_to_rgb(getattr(self, field))
+        return hex_to_rgb(self.colour(field))
 
     def bgr(self, field: str) -> int:
-        return hex_to_bgr(getattr(self, field))
+        return hex_to_bgr(self.colour(field))
+
+    def save(self, path, provenance: str = "") -> None:
+        import json
+        d = self.to_dict()
+        if provenance:
+            d["_provenance"] = provenance
+        __import__("pathlib").Path(path).write_text(json.dumps(d, indent=1), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path) -> "Style":
+        import json
+        return cls.from_dict(json.loads(__import__("pathlib").Path(path).read_text(encoding="utf-8")))
 
     def to_dict(self) -> dict:
         return asdict(self)

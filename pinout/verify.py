@@ -74,12 +74,12 @@ def spec_as_dump(spec: SymbolSpec, style: Optional[Style] = None) -> dict:
         elif f[0] == "line":
             prims.append({"type": "line", "x1": int(f[3]), "y1": int(f[4]), "x2": int(f[5]),
                           "y2": int(f[6]), "line_width": int(f[2]), "owner_part_id": part,
-                          **({"color": style.bgr("body_line")} if style else {})})
+                          **({"color": style.bgr("divider_color")} if style else {})})
         elif f[0] == "polyline":
             v = list(map(int, f[3:]))
             prims.append({"type": "polyline", "line_width": int(f[2]), "owner_part_id": part,
                           "vertices": [{"x": v[i], "y": v[i + 1]} for i in range(0, len(v), 2)],
-                          **({"color": style.bgr("body_line")} if style else {})})
+                          **({"color": style.bgr("divider_color")} if style else {})})
         elif f[0] == "label":
             prims.append({"type": "label", "text": f[4], "x": int(f[2]), "y": int(f[3]),
                           "owner_part_id": part,
@@ -186,6 +186,7 @@ def check_style(dump: dict, style: Style) -> dict:
         return {"colours_reported": False, "match": None, "checked": 0, "mismatches": [],
                 "note": "this dump carries no colour fields - re-dump with a current server"}
     want = {"body_line": style.bgr("body_line"), "body_fill": style.bgr("body_fill"),
+            "divider": style.bgr("divider_color"),
             "pin": style.bgr("pin_color"), "label": style.bgr("label_color")}
     mism, checked = [], 0
 
@@ -207,7 +208,7 @@ def check_style(dump: dict, style: Style) -> dict:
                 mism.append({"kind": k, "part": p.get("owner_part_id"), "field": "line_width",
                              "expected": style.line_width, "actual": int(p["line_width"])})
         elif k in _BODY_STROKE:
-            expect(p, "body_line", "color", want["body_line"])
+            expect(p, "divider_color", "color", want["divider"])
         elif k == "pin":
             expect(p, "pin_color", "color", want["pin"])
         elif k == "label":

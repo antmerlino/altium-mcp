@@ -173,6 +173,37 @@ class StyleCheckTest(unittest.TestCase):
         self.assertEqual((m["kind"], m["field"], m["expected"], m["actual"]),
                          ("rectangle", "body_fill", "FFFFB0", "123456"))
 
+    def test_divider_colour_is_its_own_check(self):
+        # the house library uses a different red for dividers (980000) than for
+        # the body outline (800000); the checker must not conflate them
+        from pinout.style import Style, hex_to_bgr
+        from pinout.verify import check_style
+        st = Style(body_fill="FFFFFF", body_line="800000", divider_color="980000",
+                   pin_color="000000", label_color="980000")
+        d = spec_as_dump(spec(), st)
+        poly = next(p for p in d["primitives"] if p["type"] == "polyline")
+        self.assertEqual(poly["color"], hex_to_bgr("980000"), "synthetic dump uses divider colour")
+        self.assertTrue(check_style(d, st)["match"])
+        poly["color"] = hex_to_bgr("800000")            # painted like the outline instead
+        r = check_style(d, st)
+        self.assertFalse(r["match"])
+        self.assertEqual(r["mismatches"][0]["field"], "divider_color")
+        self.assertEqual(Style(body_line="800000").colour("divider_color"), "800000",
+                         "empty divider_color falls back to body_line")
+
+    def test_house_style_file_loads_and_is_not_stock(self):
+        import tempfile
+        from pinout.style import Style
+        house = Style.load(Path(__file__).resolve().parents[1] / "house_style.json")
+        self.assertEqual((house.body_fill, house.body_line, house.divider_color, house.pin_color,
+                          house.label_color, house.line_width),
+                         ("FFFFFF", "800000", "980000", "000000", "980000", 1))
+        self.assertNotEqual(house, Style(), "the house palette is not Altium stock")
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "s.json"
+            house.save(f, provenance="test")
+            self.assertEqual(Style.load(f), house)
+
     def test_old_dump_without_colours_is_reported_not_failed(self):
         from pinout.style import Style
         from pinout.verify import check_style

@@ -20,7 +20,7 @@ project.ioc          --ioc----->  /       ^  |                      |
 | `naming.py` | House rules measured from the library: `EMBEDDED_IC_<MPN>_<BOARD>`, `PREFIX_PIN_SIGNAL__FUNCTION` net labels, `PA13 (JTMS/SWDIO)`, electrical types derived per signal. |
 | `layout.py` | `Pinout` -> symbol spec in the exact pipe-string format `create_schematic_symbol` consumes. Two strategies: **port split** (one part per port, generic) and **functional split** (peripheral-labelled clusters, board-specific). |
 | `preview.py` | Spec -> SVG, one file per part, so layout is inspected *before* any Altium call. |
-| `style.py` | The house palette (body fill/line, pin, label colours, line width) as RRGGBB, converted to Altium's `$00BBGGRR`. One `Style` drives generation, preview and verification so they cannot drift. Defaults are Altium stock. |
+| `style.py` | The palette (body fill/outline, **divider**, pin and label colours, line width) as RRGGBB, converted to Altium's `$00BBGGRR`. One `Style` drives preview, synthetic dumps and `verify.check_style` so they cannot drift. Defaults are Altium stock; `house_style.json` is the palette read from `EMBEDDED_IC_STM32H753IIK6_X57` (white body, `800000` outline, `980000` dividers and labels, black pins) - load it with `Style.load`. |
 | `verify.py` | Spec vs a `get_symbol_primitives` dump, normalised to the same shape: exactly which pins are missing, unexpected or *changed* (and in which field), which graphics differ. Nothing generated is believed until it passes this. |
 
 ## Tests

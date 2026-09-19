@@ -84,11 +84,11 @@ def render_part_svg(spec: SymbolSpec, part: int, style: Optional[Style] = None) 
         elif kind == "line":
             ax, ay, bx, by = map(int, g[3:7])
             out.append(f'<line x1="{X(ax):.1f}" y1="{Y(ay):.1f}" x2="{X(bx):.1f}" y2="{Y(by):.1f}" '
-                       f'stroke="#{style.body_line}" stroke-width="1.2"/>')
+                       f'stroke="#{style.colour("divider_color")}" stroke-width="1.2"/>')
         elif kind == "polyline":
             vals = list(map(int, g[3:]))
             pts = " ".join(f"{X(vals[i]):.1f},{Y(vals[i+1]):.1f}" for i in range(0, len(vals), 2))
-            out.append(f'<polyline points="{pts}" fill="none" stroke="#{style.body_line}" stroke-width="1"/>')
+            out.append(f'<polyline points="{pts}" fill="none" stroke="#{style.colour("divider_color")}" stroke-width="1"/>')
         elif kind == "label":
             out.append(f'<text x="{X(int(g[2])):.1f}" y="{Y(int(g[3])):.1f}" fill="#{style.label_color}" '
                        f'font-weight="bold">{_esc(g[4])}</text>')
@@ -182,10 +182,10 @@ def render_part_png(spec: SymbolSpec, part: int, path, scale: float = 0.3,
                         fill=style.rgb("body_fill"), outline=body, width=2)
         elif g[0] == "line":
             ax, ay, bx, by = map(int, g[3:7])
-            d.line([X(ax), Y(ay), X(bx), Y(by)], fill=body, width=2)
+            d.line([X(ax), Y(ay), X(bx), Y(by)], fill=style.rgb("divider_color"), width=2)
         elif g[0] == "polyline":
             v = list(map(int, g[3:]))
-            d.line([(X(v[i]), Y(v[i + 1])) for i in range(0, len(v), 2)], fill=body, width=1)
+            d.line([(X(v[i]), Y(v[i + 1])) for i in range(0, len(v), 2)], fill=style.rgb("divider_color"), width=1)
         elif g[0] == "label":
             d.text((X(int(g[2])), Y(int(g[3])) - 12), g[4], fill=lab, font=bold)
     for p in pins:
