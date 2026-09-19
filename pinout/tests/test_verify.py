@@ -1,0 +1,138 @@
+"""verify: a spec compared against what Altium reports back."""
+import copy
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from pinout.ioc import IocFile                  # noqa: E402
+from pinout.mcu_db import load_mcu_xml          # noqa: E402
+from pinout.model import Pinout                 # noqa: E402
+from pinout.layout import functional_split      # noqa: E402
+from pinout.verify import compare, spec_as_dump, normalize  # noqa: E402
+
+FIX = Path(__file__).parent / "fixtures"
+
+
+def spec():
+    p = Pinout.from_sources(load_mcu_xml(FIX / "FAKE32C20.xml"),
+                            IocFile.load(FIX / "fake_board.ioc"), board="TESTBOARD")
+    return functional_split(p, mpn="FAKE32C20U6")
+
+
+def pin(dump, number):
+    return next(p for p in dump["primitives"] if p["type"] == "pin" and p["pin_number"] == number)
+
+
+class IdentityTest(unittest.TestCase):
+    def test_faithful_dump_matches(self):
+        s = spec()
+        r = compare(s, spec_as_dump(s))
+        self.assertTrue(r["match"], r)
+        self.assertEqual(r["pins"], {"missing_in_altium": [], "unexpected_in_altium": [], "changed": []})
+        self.assertEqual(r["graphics"], {"missing_in_altium": [], "unexpected_in_altium": []})
+        self.assertEqual(r["summary"]["pins_identical"], r["summary"]["spec_pins"], r["summary"])
+        self.assertEqual(r["summary"]["spec_pins"], 20)
+
+    def test_enum_names_become_altium_integers(self):
+        d = spec_as_dump(spec())
+        self.assertEqual(pin(d, "1")["electrical"], 7, "VDD -> eElectricPower = 7")
+        self.assertEqual(pin(d, "19")["electrical"], 0, "NRST -> eElectricInput = 0")
+        self.assertEqual(pin(d, "2")["orientation"], 2, "left-facing -> eRotate180 = 2")
+        self.assertEqual(pin(d, "1")["orientation"], 0, "right-facing -> eRotate0 = 0")
+
+
+class TolerantNormalisationTest(unittest.TestCase):
+    def test_float_coordinates_and_missing_optional_keys(self):
+        s = spec()
+        d = spec_as_dump(s)
+        for p in d["primitives"]:
+            for k in ("x", "y", "x1", "y1", "x2", "y2", "length"):
+                if k in p:
+                    p[k] = float(p[k])
+            p.pop("line_width", None)
+            p.pop("show_name", None)
+        self.assertTrue(compare(s, d)["match"])
+
+    def test_polyline_direction_is_irrelevant(self):
+        s = spec()
+        d = spec_as_dump(s)
+        for p in d["primitives"]:
+            if p["type"] == "polyline":
+                p["vertices"].reverse()
+        self.assertTrue(compare(s, d)["match"])
+
+    def test_line_endpoint_order_is_irrelevant(self):
+        s = spec()
+        d = spec_as_dump(s)
+        for p in d["primitives"]:
+            if p["type"] == "line":
+                p["x1"], p["x2"], p["y1"], p["y2"] = p["x2"], p["x1"], p["y2"], p["y1"]
+        self.assertTrue(compare(s, d)["match"])
+
+
+class DetectsDifferencesTest(unittest.TestCase):
+    def setUp(self):
+        self.s = spec()
+        self.d = spec_as_dump(self.s)
+
+    def test_dropped_pin_is_missing(self):
+        self.d["primitives"] = [p for p in self.d["primitives"]
+                                if not (p["type"] == "pin" and p["pin_number"] == "4")]
+        r = compare(self.s, self.d)
+        self.assertFalse(r["match"])
+        self.assertEqual([p["pin_name"] for p in r["pins"]["missing_in_altium"]], ["PA2"])
+        self.assertEqual(r["pins"]["unexpected_in_altium"], [])
+        self.assertEqual(r["pins"]["changed"], [])
+
+    def test_moved_pin_reports_a_change_not_a_pair(self):
+        pin(self.d, "4")["y"] -= 100
+        r = compare(self.s, self.d)
+        self.assertFalse(r["match"])
+        self.assertEqual(len(r["pins"]["changed"]), 1)
+        c = r["pins"]["changed"][0]
+        self.assertEqual((c["pin_number"], c["differs_in"]), ("4", ["y"]))
+        self.assertEqual(c["spec"]["y"] - c["altium"]["y"], 100)
+        self.assertEqual(r["pins"]["missing_in_altium"], [])
+        self.assertEqual(r["pins"]["unexpected_in_altium"], [])
+
+    def test_wrong_electrical_type(self):
+        pin(self.d, "4")["electrical"] = 1          # spec says Output (2) for USART2_TX
+        c = compare(self.s, self.d)["pins"]["changed"][0]
+        self.assertEqual(c["differs_in"], ["electrical"])
+        self.assertEqual((c["spec"]["electrical"], c["altium"]["electrical"]),
+                         ("eElectricOutput", "eElectricIO"))
+
+    def test_renamed_label(self):
+        lab = next(p for p in self.d["primitives"] if p["type"] == "label" and p["text"] == "SWD")
+        lab["text"] = "JTAG"
+        r = compare(self.s, self.d)
+        self.assertFalse(r["match"])
+        self.assertEqual([g[-1] for g in r["graphics"]["missing_in_altium"]], ["SWD"])
+        self.assertEqual([g[-1] for g in r["graphics"]["unexpected_in_altium"]], ["JTAG"])
+
+    def test_extra_graphic_in_altium(self):
+        self.d["primitives"].append({"type": "rectangle", "x1": 0, "y1": 0, "x2": 10, "y2": 10,
+                                     "owner_part_id": 1})
+        r = compare(self.s, self.d)
+        self.assertEqual(len(r["graphics"]["unexpected_in_altium"]), 1)
+        self.assertEqual(r["graphics"]["missing_in_altium"], [])
+
+    def test_part_count_and_name(self):
+        self.d["part_count"] = 5
+        self.d["symbol_name"] = "SOMETHING_ELSE"
+        r = compare(self.s, self.d)
+        self.assertFalse(r["match"])
+        self.assertFalse(r["part_count"]["same"])
+        self.assertFalse(r["symbol_name"]["same"])
+
+    def test_empty_dump_reports_everything_missing(self):
+        r = compare(self.s, {"symbol_name": self.s.name, "part_count": self.s.part_count,
+                             "primitives": []})
+        self.assertFalse(r["match"])
+        self.assertEqual(len(r["pins"]["missing_in_altium"]), 20)
+        self.assertEqual(r["summary"]["altium_pins"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

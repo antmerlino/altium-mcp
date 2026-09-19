@@ -9,7 +9,7 @@ CubeMX db/mcu/*.xml  --mcu_db-->  \
                                      model.Pinout  --layout-->  SymbolSpec  --preview-->  SVG
 project.ioc          --ioc----->  /       ^  |                      |
                                           |  +--apply_to_ioc-->  .ioc      +--(Altium) create_schematic_symbol
-                                    JSON / XLSX                                   then get_symbol_primitives + render
+                                    JSON / XLSX                                   then get_symbol_primitives --verify.compare--> report
 ```
 
 | Module | Purpose |
@@ -20,6 +20,7 @@ project.ioc          --ioc----->  /       ^  |                      |
 | `naming.py` | House rules measured from the library: `EMBEDDED_IC_<MPN>_<BOARD>`, `PREFIX_PIN_SIGNAL__FUNCTION` net labels, `PA13 (JTMS/SWDIO)`, electrical types derived per signal. |
 | `layout.py` | `Pinout` -> symbol spec in the exact pipe-string format `create_schematic_symbol` consumes. Two strategies: **port split** (one part per port, generic) and **functional split** (peripheral-labelled clusters, board-specific). |
 | `preview.py` | Spec -> SVG, one file per part, so layout is inspected *before* any Altium call. |
+| `verify.py` | Spec vs a `get_symbol_primitives` dump, normalised to the same shape: exactly which pins are missing, unexpected or *changed* (and in which field), which graphics differ. Nothing generated is believed until it passes this. |
 
 ## Tests
 
@@ -40,7 +41,7 @@ The spreadsheet round-trip test skips unless `openpyxl` is installed.
   designer typed -> diff -> apply.
 - **Nothing is written to Altium until it has been previewed**, and nothing
   written is trusted until it has been read back (`get_symbol_primitives`)
-  and rendered (`render_schematic`). A tool reporting success once drew
+  and compared (`verify.compare`) against the spec that produced it. A tool reporting success once drew
   nothing at all; only the render showed it.
 - Coordinates are mils, y up, 100-mil pitch. Pin length is a parameter
   (200 in the G431 symbols, 300 in the H753 ones).
