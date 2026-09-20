@@ -72,6 +72,19 @@ check until the picture showed it.
    use `run_altium_script` with `MoveByXY` and check `BoundingRectangle`; put
    the border directive back on an edge row that carries no wire.
 
+## 2b. Prefer the cluster-level tools
+
+- `copy_schematic_area(area, by, renames)` clones a whole cluster and renames
+  every text field (labels, port, class marks, harness type, entries,
+  designators) in one call; `move_schematic_area(area, by)` shifts one.
+  Exclude the main part by lib reference. The preview lists boundary-crossing
+  wires - fix the rectangle until it lists none.
+- `copy_component` for another pad or pull-up; `set_harness_connectors` when
+  a connector needs edits a copy cannot express.
+- `check_sheet_conventions(document=...)` after every batch, and read the
+  errors before the next batch. Zero errors is the bar; warnings need a
+  sentence each in the report.
+
 ## 3. Verify
 
 - `check_net_labels`: 0 floating.

@@ -285,6 +285,55 @@ whole frame. The X9 sheet has ZERO `eJunction` objects although every
 pull-up drop shows a dot: Altium draws T-junctions itself, so a drop wire
 ending on another wire needs no junction object.
 
+### Compile messages are NOT reachable from a script
+
+`GetWorkspace.DM_MessagesManager` is non-nil, but `GetMessageCount` and
+`MessageCount` are undeclared on it, late-bound or through a typed
+`IDMMessagesManager` variable. The only members known to work are the write
+side the user's own scripts use (`ClearMessages`, `BeginUpdate`,
+`AddMessage`, `EndUpdate`). Altium's ERC panel therefore cannot be read; the
+feedback loop is `check_schematic` (compiled netlist: single-pin nets,
+duplicates, unannotated) plus `check_sheet_conventions` (geometry + house
+rules) plus `render_schematic`.
+
+### Creating a scratch sheet: `CreateNewDocumentFromDocumentKind('SCH')`
+
+`GetWorkSpace.DM_CreateNewDocument('SCH')` creates the document AND raises
+`EVariantTypeCastError ... (Dispatch) into type (Boolean)` on the statement,
+so the script dies right after making it (two empty sheets that way).
+`Obj := CreateNewDocumentFromDocumentKind('SCH'); Client.ShowDocument(Obj);`
+works and the new sheet becomes `GetCurrentSchDocument`. Free documents are
+addressed by bare name: `SchServer.GetSchDocumentByPath('Sheet3.SchDoc')`,
+`Client.GetDocumentByPath('Sheet3.SchDoc')`, `Client.CloseDocument(doc)`
+closes an unmodified one without a prompt.
+
+### Bookkeeping across passes: `Selection`, not `I_ObjectAddress`
+
+`IntToStr(Obj.I_ObjectAddress)` raises the same Dispatch/Boolean cast error
+(the address is only usable as a `SendMessage` argument). To act on "the
+objects that were inside the area before I started adding copies", clear
+`Selection` on every candidate, set it on the matches, then act on
+`Selection = True` and clear it as you go; give copies `Selection := False`
+before registering. `UniqueId` (a short string) also reads fine. Filter the
+iterator to the kinds you touch: the unfiltered iterator yields sheet-level
+objects without a `Selection` member ("Undeclared identifier: Selection").
+
+### `Replicate` crosses documents
+
+A component replicated from one sheet and registered on another keeps
+absolute pin coordinates, draws, and takes a new `Designator.Text` - the
+working route to "another test pad" while library placement stays broken.
+
+### `Sch:Undo` from a script is a no-op; the area render works
+
+`ResetParameters; RunProcess('Sch:Undo')` after `Client.ShowDocument` on a
+dirty free sheet, four times in a row: nothing changed (measured). Undo stays
+with the person at the keyboard - each applied tool call is one Ctrl+Z step.
+
+Rendering one area works: filter the iterator to drawable kinds, set
+`Selection := True` on what lies inside, `Sch:Copy`, rasterise the clipboard
+metafile. The picture is only the selection, at whatever scale you ask for.
+
 ## Members verified working
 
 `SchServer`: `GetCurrentSchDocument`, `SchObjectFactory(kind, eCreate_Default)`,
