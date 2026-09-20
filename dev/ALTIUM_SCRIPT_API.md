@@ -254,6 +254,37 @@ result at all - the value is only collected at a clean end. Two probes lost
 their whole payload that way. Put uncertain members in their own script, or
 log the values with `SandboxLog` (flushed immediately) instead.
 
+### Address the sheet by PATH, not by focus
+
+`SchServer.GetCurrentSchDocument` is nil whenever the focused document is
+not a schematic: the user clicked another tab, or a compile focused the
+sandbox script project. Every sheet tool now takes `document=` and uses
+`SchServer.GetSchDocumentByPath('D:\\...\\Sheet.SchDoc')`, which needs the
+sheet OPEN but not focused and never steals the user's view. Edits on a
+non-focused sheet apply and render normally.
+
+### `DM_FocusedProject` is the sandbox script project after any script
+
+After `run_altium_script` (and after a compile) the focused project is
+`Sandbox.PrjScr`; compiling it yields "no flattened document". The
+netlist / doc-state / save scripts now pick the project that owns the
+focused schematic and never a `.PrjScr` while a `.PrjPcb` is open.
+
+### `REPLACEALL` is a CONSTANT, not a function
+
+The sandbox defines `REPLACEALL = 1` as the `StringReplace` flag. Calling
+`REPLACEALL(s, a, b)` is the compile error "; expected", so nothing runs.
+Use `Copy` / `Pos` string surgery, or `StringReplace(s, a, b, REPLACEALL)`.
+
+### Notes (`eNote`) resize through `Location`; junctions draw themselves
+
+A note's `Text` is read/write with real line breaks (CR LF), `Corner` reads
+back, and assigning `Location` moves only that corner - so growing a text
+frame downward is `Location := Point(X, Y - 5000000)`. `MoveByXY` moves the
+whole frame. The X9 sheet has ZERO `eJunction` objects although every
+pull-up drop shows a dot: Altium draws T-junctions itself, so a drop wire
+ending on another wire needs no junction object.
+
 ## Members verified working
 
 `SchServer`: `GetCurrentSchDocument`, `SchObjectFactory(kind, eCreate_Default)`,

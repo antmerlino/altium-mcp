@@ -12,6 +12,14 @@ with no warning from Altium. This happened on the X9 MC comms sheet on
 
 ## 0. Ground rules
 
+- Pass `document=<full path>` to every sheet tool. The focused document
+  changes under you (a tab click, a compile) and "Undeclared identifier:
+  DocumentName" is what a nil focused document looks like.
+- Before guessing a bus's meaning, read the sibling sheets offline
+  (`pinout.schdoc.read_records`): the parent's ports and sheet entries name
+  the single-signal lines, the other MCU's comms sheet names the link
+  between them, notes on the sheet name the buses.
+
 - Ask before touching Altium if the user is working in it; batch your writes;
   say when you are done. Never save unless asked (`save_documents` previews).
 - Every writer previews by default. Preview, read the warnings, then apply.
@@ -53,8 +61,13 @@ check until the picture showed it.
    existing assemblies with the same delta as their wires; create new ones by
    replicating an assembly of the same type AND side, then edit type, size,
    primary connection position and entries. The API cannot flip a connector.
-4. Ports: `set_schematic_ports` / `move_schematic_objects`. A port must sit
-   at its harness end (left: harness meets `x + width`; right: meets `x`).
+4. Ports: `set_schematic_ports` / `move_schematic_objects`. A harness port
+   sits at its harness end (left: harness meets `x + width`; right: meets
+   `x`); a single-signal line gets a PLAIN port `<PIN>_<SIGNAL>` at the
+   wire end.
+4b. Test pads: MFG pads directly on the wire (pin end on the row, mark
+   100 mil inboard); probe pads in the free band above the cluster with a
+   drop wire each, no junction objects. Notes: retitle and grow them.
 5. Blankets: `move_schematic_objects` kind is not available for blankets yet -
    use `run_altium_script` with `MoveByXY` and check `BoundingRectangle`; put
    the border directive back on an edge row that carries no wire.
