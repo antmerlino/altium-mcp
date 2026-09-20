@@ -165,6 +165,17 @@ pin numbers, designator suffixes) must be typed `Union[str, int]` and
 normalised, reading the int's decimal digits back verbatim and zero-padding
 (`_hex6` in main.py). Measured 2026-09-19 on `apply_symbol_style`.
 
+### eCreate_GlobalCopy clones the last-edited object's VERTICES
+
+`SchObjectFactory(eWire, eCreate_GlobalCopy)` starts from Altium's "global"
+wire, which carries the vertex list of the wire the user last edited. With a
+3-vertex template every wire you then build by InsertVertex/SetState_Vertex
+keeps the leftover vertex, and 56 new wires fanned diagonals to one point
+(measured 2026-09-19 on MC_STM32H753XIHx_Comms). There is NO `DeleteVertex`
+(Undeclared identifier). Use `eCreate_Default` for wires: 0 vertices, same
+LineWidth (1) and Color (8388608). Probe results: GlobalCopy VerticesCount
+was 1 on a later probe, so the template also changes as the user works.
+
 ## Members verified working
 
 `SchServer`: `GetCurrentSchDocument`, `SchObjectFactory(kind, eCreate_Default)`,
