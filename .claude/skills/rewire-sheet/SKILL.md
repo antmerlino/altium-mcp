@@ -87,6 +87,11 @@ check until the picture showed it.
 
 ## 3. Verify
 
+- `check_hierarchy_live(document=<parent sheet>)` whenever you add, rename or
+  remove a PORT. A port with no matching sheet entry on the parent (or a
+  harness type that disagrees) is a broken connection that no single-sheet
+  check can see; fix it with `set_sheet_entries`.
+
 - `check_net_labels`: 0 floating.
 - Re-dump `paramset`, `harness`, `component`+`pin`, `port` and confirm every
   directive / pad pin / entry lies on a wire end of the intended row, every

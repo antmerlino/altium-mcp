@@ -285,6 +285,52 @@ whole frame. The X9 sheet has ZERO `eJunction` objects although every
 pull-up drop shows a dot: Altium draws T-junctions itself, so a drop wire
 ending on another wire needs no junction object.
 
+### `Exit` in the sandbox body used to swallow the result
+
+The natural guard, `if Doc = nil then begin ResultText := 'ABORT|...'; Exit;
+end;`, returned from `Run` BEFORE the result file was written, so the tool
+reported "script started but did not finish" with no dialog and no result -
+the most misleading failure a correct script could produce. `Sandbox.pas` now
+writes the result in a `finally`, and a guard's Exit hands its result back
+(verified). Bodies written before this fix are unaffected.
+
+### Sheet symbols and sheet entries
+
+`ISch_SheetSymbol`: `SheetName.Text`, `SheetFileName.Text`, `Location`,
+`XSize`, `YSize`. There is no `FileName` (undeclared). `ISch_SheetEntry`:
+`Name`, `Side` (1 = right edge, 0 = left), `DistanceFromTop`, `IOType`,
+`Style`, `ArrowKind`, `HarnessType`.
+
+Create both with the factory; a symbol registers on the sheet
+(`RegisterSchObjectInContainer`), an entry belongs to its symbol
+(`Symbol.AddSchObject(entry)` then `SCHM_PrimitiveRegistration` addressed to
+the SYMBOL). Same trap as harness entries: a new entry reports `Location`
+0,0 until it is placed explicitly, at `Symbol.Location.X` (+ `XSize` for side
+1) and `Symbol.Location.Y - DistanceFromTop`. All verified on a scratch sheet.
+
+### Closing a scratch document without a save prompt
+
+`Doc.Modified := False;` then `Client.CloseDocument(Doc)` closes a dirty free
+document silently (verified). Without clearing Modified, the close raises a
+save prompt that blocks every later dispatch.
+
+### A compiled project keeps every sheet in memory
+
+After `DM_Compile` (or an ERC run), `SchServer.GetSchDocumentByPath` reaches
+any sheet of the project without opening a tab, so a cross-sheet read costs
+one dispatch. The official `IterateSchSheets.pas` example carries the same
+caveat from the other side: documents report as open when they are only
+loaded.
+
+### Process parameters are not published
+
+`Client.GetServerRecord(i).GetCommand(j)` enumerates all 1033 processes
+across 90 servers with `GetOriginalId` and `GetLongSummary`, but
+`GetParameterCount` is non-zero for exactly 5 of them. Process parameters
+have to come from Altium's documentation or from a working example, not from
+the API. `dev/altium_process_catalog.txt` already holds the names and
+summaries, so regenerating it buys nothing.
+
 ### ERC IS reachable - through the report, not the panel
 
 `ResetParameters; AddStringParameter('ObjectKind','Validation');
