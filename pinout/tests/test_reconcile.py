@@ -160,6 +160,54 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(d.apply_to, [], "configuring the oscillator is a CubeMX decision, not a write we make")
         self.assertNotIn("PH13:net", self.by, "a spare pin named after itself agrees everywhere")
 
+    def test_diagnosis_kinds(self):
+        by = self.by
+        self.assertEqual(by["PB5:signal"].kind, "sheet_stale")
+        self.assertEqual(by["PB5:signal"].suggested, "accept")
+        self.assertEqual(by["PG9:function"].kind, "ioc_label_missing_function")
+        self.assertIn("CubeMX .ioc: PG9.GPIO_Label = 'USART6_RX__DBG' (now empty)", by["PG9:function"].fix_text())
+        self.assertEqual(by["PD5:signal"].kind, "symbol_label_wrong")
+        self.assertIn("group label 'GPIO' -> 'UART2'", by["PD5:signal"].fix_text())
+        self.assertEqual(by["PD5:net"].kind, "sheet_gap")
+        self.assertIn("Sheet: 'Pin Definitions'", by["PD5:net"].fix_text())
+        self.assertEqual(by["PH0:signal"].kind, "clock_unconfigured")
+        self.assertIn("crystal", by["PH0:signal"].why)
+        self.assertEqual(by["PH0:signal"].fix_text(), "nothing the tool can write; see Why")
+
+    def test_role_vs_signal_is_recognised_as_both_right(self):
+        # PA10: TIM1_CH3 input capture reading a sensor's DRDY; the .ioc label already says so
+        ioc = {"PA10": {"name": "PA10", "ball": "D15", "signal": "S_TIM1_CH3", "cube_label": "SPI2_DRDY1__SE1", "function": "SE1"}}
+        sh = {"PA10": {"name": "PA10", "signal": "TIM1_CH3", "function": "SE1", "net": "FC_PA10_SPI2_DRDY1__SE1"}}
+        sc = {"PA10": {"name": "PA10", "ball": "D15", "labels": ["FC_PA10_SPI2_DRDY1__SE1"], "net": "FC_PA10_SPI2_DRDY1__SE1",
+                       "signal": "SPI2_DRDY1", "function": "SE1", "group": "TIM1", "symbol_label": "TIM1", "sheets": ["S"], "wired": True}}
+        rep = rc.reconcile(board(), ioc, sh, sc)
+        kinds = {d.id: (d.kind, d.suggested, d.apply_to) for d in rep.diffs}
+        self.assertEqual(kinds["PA10:signal"][:2], ("role_vs_signal", "ignore"))
+        self.assertEqual(kinds["PA10:signal"][2], [], "accept changes nothing")
+        self.assertEqual(kinds["PA10:net"][:2], ("role_vs_signal", "ignore"))
+        self.assertIn("MECHANISM", next(d for d in rep.diffs if d.id == "PA10:signal").why)
+        # ... and a 'custom' decision still knows every write needed
+        d = next(d for d in rep.diffs if d.id == "PA10:net")
+        ws = rc.writes_for(d, "FC_PA10_TIM1_CH3__SPI2_DRDY1_SE1", board())
+        self.assertEqual({w["target"] for w in ws}, {"sheet", "altium"})
+
+    def test_dual_use_and_analog_meaning(self):
+        ioc = {"PA8": {"name": "PA8", "ball": "E15", "signal": "RCC_MCO_1", "mode": "Clock-out-1", "cube_label": "MEI_nRST2", "function": "MEI_nRST2"},
+               "PF10": {"name": "PF10", "ball": "L3", "signal": "ADC3_INP6", "cube_label": "VARIANT_SENSE", "function": "VARIANT_SENSE"}}
+        sh = {"PA8": {"name": "PA8", "signal": "GPIO_Output", "function": "MEI_nRST2", "net": "MC_PA8__MEI_nRST2__MCO1"},
+              "PF10": {"name": "PF10", "signal": "ADC3_INP6", "function": "BB", "net": "MC_PF10_VARIANT_SENSE"}}
+        sc = {"PF10": {"name": "PF10", "ball": "L3", "labels": ["MC_PF10_VARIANT_SENSE"], "net": "MC_PF10_VARIANT_SENSE",
+                       "signal": "VARIANT_SENSE", "function": None, "group": "ADC3", "symbol_label": "ADC3", "sheets": ["S"], "wired": True}}
+        b = Board("Test MC", "MC", "x", "y", board().sheet, board().altium, debug_style="SWD_SWDIO")
+        rep = rc.reconcile(b, ioc, sh, sc)
+        by = {d.id: d for d in rep.diffs}
+        self.assertEqual(by["PA8:signal"].kind, "dual_use")
+        self.assertIn("two roles", by["PA8:signal"].why)
+        self.assertEqual(by["PF10:function"].kind, "role_vs_signal")
+        self.assertEqual(by["PF10:function"].apply_to, [], "the .ioc label VARIANT_SENSE is the meaning; nothing to fix")
+        self.assertEqual(by["PF10:net"].kind, "convention_variant")
+        self.assertIn("MC_PF10__VARIANT_SENSE", by["PF10:net"].why)
+
     def test_report_rendering_and_json(self):
         text = rc.format_report(self.rep)
         self.assertIn("disagreements", text)
@@ -207,6 +255,9 @@ class PublishCollectApplyTest(unittest.TestCase):
         self.assertIn("Reconcile", [t["title"] for t in self.sheets.open(WB)["tabs"]])
         grid = self.be.grid(WB, "Reconcile")
         self.assertEqual(grid[0][:4], ["Id", "Pin", "Ball", "Field"])
+        self.assertEqual(grid[0][rc.DECISION_COL], "Decision")
+        self.assertIn("Why", grid[0])
+        self.assertIn("What accept does", grid[0])
         dv = [c for c in self.be.calls if c[0] == "batch_update" and "setDataValidation" in c[2][0]]
         self.assertTrue(dv, "Decision column got a dropdown")
         # the designer decides in the sheet
@@ -215,9 +266,10 @@ class PublishCollectApplyTest(unittest.TestCase):
                                   header_row=1, apply=True)
         decisions = rc.collect(self.board, self.sheets)
         self.assertEqual(decisions["PB5:signal"]["decision"], "accept")
-        plan = rc.plan_writes(rep, decisions)
+        plan = rc.plan_writes(rep, decisions, self.board)
         self.assertEqual(plan["counts"]["sheet"], 2, "PB5 signal column + PD5 net column")
-        self.assertEqual(plan["counts"]["altium"], 1, "PB5 symbol label")
+        self.assertEqual(plan["counts"]["altium"], 2, "PB5 symbol label + PD5 schematic rename to the custom name")
+        self.assertTrue(all(isinstance(t, str) and t for t in plan["described"]["sheet"]))
         self.assertEqual([w["value"] for w in plan["writes"]["sheet"] if w["pin"] == "PD5"], ["FC_PD5_CUSTOM"])
         pre = rc.apply_sheet_writes(self.board, self.sheets, plan["writes"]["sheet"])
         self.assertFalse(pre["applied"])

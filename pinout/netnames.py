@@ -66,11 +66,17 @@ def signal_spellings(signal: Optional[str]) -> List[str]:
     return [s for s in out if not (s in seen or seen.add(s))]
 
 
-def preferred_spelling(signal: Optional[str]) -> Optional[str]:
-    """The spelling the sheets use most: abbreviated form when one exists."""
+def preferred_spelling(signal: Optional[str], debug_style: Optional[str] = None) -> Optional[str]:
+    """The spelling the sheets use most: abbreviated form when one exists.
+    debug_style picks the debug-pin family: "SWDIO" (FC) or "SWD_SWDIO" (MC)."""
     sp = signal_spellings(signal)
     if not sp:
         return None
+    if debug_style and signal in WHOLE_ABBREV:
+        want_prefix = "SWD_" if debug_style.upper().startswith("SWD_") else None
+        for s in sp[1:]:
+            if (want_prefix and s.startswith(want_prefix)) or (not want_prefix and not s.startswith("SWD_")):
+                return s
     return sp[1] if len(sp) > 1 and sp[1] != signal else sp[0]
 
 
@@ -129,7 +135,7 @@ def split_gpio_label(label: Optional[str]):
 
 
 def generate(prefix: str, pin: str, signal: Optional[str], function: Optional[str] = None,
-             gpio_style: Optional[bool] = None, role: Optional[str] = None) -> str:
+             gpio_style: Optional[bool] = None, role: Optional[str] = None, debug_style: Optional[str] = None) -> str:
     """The label for a pin. GPIO_* signals (and pins with no signal) use the
     PREFIX_PIN__Function form, or PREFIX_PIN_Role__Function when the GPIO has a
     role word (a chip select); peripherals PREFIX_PIN_Signal[__Function].
@@ -140,7 +146,7 @@ def generate(prefix: str, pin: str, signal: Optional[str], function: Optional[st
         if role:
             return f"{prefix}_{base}_{role}" + (f"__{function}" if function else "")
         return f"{prefix}_{base}__{function}" if function else f"{prefix}_{base}"
-    sig = preferred_spelling(signal)
+    sig = preferred_spelling(signal, debug_style)
     return f"{prefix}_{base}_{sig}" + (f"__{function}" if function else "")
 
 

@@ -81,8 +81,14 @@ def ioc_facts(board: Board) -> Tuple[Facts, dict]:
                       "cube_label": rec.label, "function": function_from_cube_label(rec.signal, rec.label), "role": role,
                       "group": naming.canonical_group(naming.peripheral_group(rec.signal)) if rec.signal else None,
                       "mcu_type": rec.mcu_type, "alternates": list(rec.signals)}
+    rcc = {k: ioc.get(k) for k in ioc.keys("RCC.")}
+    pll = rcc.get("RCC.PLLSourceVirtual") or rcc.get("RCC.PLLSource") or ""
     diag = {"mcu": mcu.ref_name, "package": mcu.package, "ioc_pins_assigned": len(p.assigned()),
-            "port_pins": len(facts), "ioc_pins_not_in_mcu": p.meta.get("ioc_pins_not_in_mcu", "")}
+            "port_pins": len(facts), "ioc_pins_not_in_mcu": p.meta.get("ioc_pins_not_in_mcu", ""),
+            "clock": {"pll_source": pll.replace("RCC_PLLSOURCE_", "") or None,
+                      "hse": any(r.signal and r.signal.startswith("RCC_OSC_") for r in p.pins),
+                      "lse": any(r.signal and r.signal.startswith("RCC_OSC32_") for r in p.pins),
+                      "hse_value": rcc.get("RCC.HSE_VALUE")}}
     return facts, diag
 
 
@@ -241,15 +247,16 @@ def schematic_facts(board: Board) -> Tuple[Facts, dict]:
         group_of = {}
         for c in infer_clusters(dump):
             for p in c.pins:
-                group_of[str(p["pin_number"])] = (c.label, c.inherited)
+                group_of[str(p["pin_number"])] = (c.label, c.inherited, c.part)
         for p in dump["primitives"]:
             if p["type"] != "pin" or not naming.is_port_pin(p["pin_name"].replace(" C", "_C")):
                 continue
             key = pin_key(p["pin_name"])
             f = facts.setdefault(key, {"name": p["pin_name"], "ball": p["pin_number"], "labels": [], "sheets": []})
-            lab, inherited = group_of.get(str(p["pin_number"]), (None, False))
+            lab, inherited, part = group_of.get(str(p["pin_number"]), (None, False, p.get("owner_part_id")))
             f["symbol_label"] = lab
             f["symbol_label_inherited"] = inherited
+            f["symbol_part"] = part
             f["group"] = None if (lab is None or is_port_label(lab)) else naming.canonical_group(lab)
             f["electrical"] = ELECTRICAL_NAME.get(int(p["electrical"]), p["electrical"])
     for f in facts.values():
