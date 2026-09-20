@@ -176,6 +176,84 @@ keeps the leftover vertex, and 56 new wires fanned diagonals to one point
 LineWidth (1) and Color (8388608). Probe results: GlobalCopy VerticesCount
 was 1 on a later probe, so the template also changes as the user works.
 
+### `List1` is declared, not created
+
+The sandbox declares `List1: TStringList` and nothing else. `List1.Add(...)`
+on it dies with an unreadable "Error" box after the previous `SandboxLog`.
+Start every script that uses it with `List1 := TStringList.Create;`.
+
+### `MoveByXY` moves a container WITH its children; `Location :=` does not
+
+Verified on a parameter set (its hidden `ClassName` parameter kept its
+offset) and on a test-pad component (its pin's electrical point followed).
+Use `Obj.MoveByXY(dx, dy)` inside a Begin/EndModify pair for anything that
+owns children. Wrapping several moves in one PreProcess/PostProcess gives one
+undo step; 49 moves in one script took under two seconds.
+
+### A directive is a container: `eParameterSet` + hidden `eParameter` children
+
+What the GUI calls a Net Class / Differential Pair / generic directive is one
+object kind, `eParameterSet` (ObjectId 28). Its `Name` is the visible label;
+the meaning is in HIDDEN child parameters:
+
+| Directive | Children |
+|---|---|
+| net class | `ClassName=<pcb class>` |
+| differential pair | `DifferentialPair=True`, `DifferentialPairClassName=<pair>` |
+
+Read them with a child iterator filtered on `eParameter` (`IsHidden` is
+readable). Create one with `SchObjectFactory(eParameterSet, eCreate_Default)`,
+set `Name`, `Location`, `Orientation`, `Color`, then
+`SchObjectFactory(eParameter, eCreate_Default)` for each child with `Name`,
+`Text`, `IsHidden := True`, `Set.AddSchObject(Child)`, and finally register
+the set on the sheet. Verified: the read-back shows the child, hidden. The
+parameter set marks a net only when its Location lies ON a wire.
+
+### Ports: all of these members read and write
+
+`Name`, `HarnessType` (string), `Width`, `Height`, `Style`, `Alignment`,
+`Color`, `AreaColor`, `TextColor`, `FontID`, `Location`. Create with
+`SchObjectFactory(ePort, eCreate_Default)` and register. **`IOType` is the
+exception**: writing 3 (bidirectional) reads back 0, and ports whose file
+record says `IOType=3` also read 0 through the API, so treat that member as
+unverified rather than broken - check the rendered port arrows instead.
+
+### Harness objects live in a second stream, and the API sees them
+
+`eHarnessConnector` = 53, `eHarnessEntry` = 54, `eSignalHarness` = 56,
+`eBlanket` = 61 (`eCompileMask` also exists). In the .SchDoc these are
+RECORD 215 / 216 / 218 / 225 in the **"Additional"** OLE stream, not in
+"FileHeader" - an offline parser that reads only FileHeader reports a sheet
+with no harnesses, which is exactly what happened here before the render
+showed them. `pinout/schdoc.py` now reads both streams.
+
+Connector geometry (all verified live): `Location` is the TOP-LEFT corner;
+`XSize` / `YSize`; each entry's `Location` is the electrical point at
+`Location.Y - DistanceFromTop` on the right edge (`Side` = 1) or the left
+edge (`Side` = 0); `PrimaryConnectionPosition` is how far below the top the
+signal harness attaches on the opposite edge; `HarnessType` is a string and
+setting it also re-labels the connector. A signal harness is a polyline:
+`VerticesCount`, `Vertex[i]`, `SetState_Vertex`, `LineWidth`, `Color`.
+
+What does NOT exist through the API: `HarnessConnectorSide` (the file key
+that flips a connector so its entries are on the left) and `Corner` on a
+blanket (`BoundingRectangle.Left/Top/Right/Bottom` works). So a right-side
+connector cannot be built from `eCreate_Default`; **`Replicate` an existing
+one of the right side and type**, `MoveByXY` it (entries and type label
+follow), register it, then edit `HarnessType`, `YSize`,
+`PrimaryConnectionPosition`, entry `Name`s, remove entries with
+`Connector.RemoveSchObject(entry)`, and add entries with
+`SchObjectFactory(eHarnessEntry, eCreate_Default)` + `Connector.AddSchObject`.
+An entry added that way reports `Location` 0,0 until it is placed
+explicitly - see the fix in `set_harness_connectors`.
+
+### `ResultText` dies with the script
+
+If any statement after `ResultText := ...` raises, the tool returns no
+result at all - the value is only collected at a clean end. Two probes lost
+their whole payload that way. Put uncertain members in their own script, or
+log the values with `SandboxLog` (flushed immediately) instead.
+
 ## Members verified working
 
 `SchServer`: `GetCurrentSchDocument`, `SchObjectFactory(kind, eCreate_Default)`,
@@ -279,11 +357,13 @@ only where `PartCount = 1`, and reports the rest.
 
 ### Creating wires
 
-Wires use `eCreate_GlobalCopy`, not `eCreate_Default`, and need their vertices
-inserted one at a time (1-based):
+Wires use `eCreate_Default` (a clean object with zero vertices) and need their
+vertices inserted one at a time (1-based). Do NOT use `eCreate_GlobalCopy`: it
+clones the last-edited wire's vertex list, and there is no `DeleteVertex` to
+clean that up - see the trap below.
 
 ```pascal
-Obj := SchServer.SchObjectFactory(eWire, eCreate_GlobalCopy);
+Obj := SchServer.SchObjectFactory(eWire, eCreate_Default);
 Obj.Location := Point(x1, y1);
 Obj.InsertVertex := 1;  Obj.SetState_Vertex(1, Point(x1, y1));
 Obj.InsertVertex := 2;  Obj.SetState_Vertex(2, Point(x2, y2));

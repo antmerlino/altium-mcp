@@ -70,13 +70,36 @@ def parse_records(data: bytes) -> List[dict]:
     return out
 
 
-def read_records(path) -> List[dict]:
+def read_records(path, streams=("FileHeader", "Additional")) -> List[dict]:
+    """Every record in the sheet, in stream order.
+
+    A .SchDoc keeps two record streams. "FileHeader" holds the classic
+    objects (components, pins, wires, labels, ports, parameter sets...).
+    "Additional" holds the harness family - harness connectors (RECORD 215),
+    harness entries (216), harness type labels (217), signal harnesses (218) -
+    and blankets (225). Reading only FileHeader silently reports a sheet
+    with no harnesses at all; that mistake cost a whole rewire pass once.
+
+    Records from the second stream are tagged with "_stream" so an owner
+    index (OwnerIndex / OwnerIndexAdditionalList) can be resolved within the
+    right list; the second stream's own header record is dropped.
+    """
     import olefile                      # only needed for real files
     ole = olefile.OleFileIO(str(path))
+    out: List[dict] = []
     try:
-        return parse_records(ole.openstream("FileHeader").read())
+        for n, name in enumerate(streams):
+            if not ole.exists(name):
+                continue
+            recs = parse_records(ole.openstream(name).read())
+            if n:
+                recs = [r for r in recs if r.get("RECORD") is not None]
+            for r in recs:
+                r["_stream"] = name
+            out.extend(recs)
     finally:
         ole.close()
+    return out
 
 
 def _num(r: dict, key: str, default: int = 0) -> int:
