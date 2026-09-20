@@ -223,7 +223,7 @@ def compare_pin(board: Board, key: str, ioc: dict, sh: dict, sch: dict) -> List[
     s_is_role = False
     ctx_base = {"signal": i_sig, "cube_label": ioc.get("cube_label"), "sheet_net": s_net, "schematic_net": c_net,
                 "sheets": sch.get("sheets", []), "symbol_label": sch.get("symbol_label"), "symbol_part": sch.get("symbol_part"),
-                "pin_name": pin_name, "mode": ioc.get("mode")}
+                "pin_name": pin_name, "mode": ioc.get("mode"), "sheet_rows": dict(sh.get("_rows") or {})}
 
     def diff(fld, values, status, proposed=None, apply_to=None, note="", **ctx):
         out.append(Diff(f"{key}:{fld}", key, ball, fld, values, status, proposed, apply_to or [], note,
@@ -631,18 +631,19 @@ def writes_for(d: Diff, value, board: Board) -> List[dict]:
     """Every write that makes all sources say `value` for this diff's field."""
     c, v = d.ctx, d.values
     out: List[dict] = []
+    sh_ctx = {"_rows": c.get("sheet_rows") or {}}
     if d.field == "signal":
         if value != v.get("cubemx"):
             out.append({"target": "ioc", "field": "Signal", "pin": d.pin, "value": value, "current": v.get("cubemx")})
         if value != (v.get("sheet") or "").replace(" (role)", "") and board.sheet:
-            out.append({"target": "sheet", "field": "signal", "pin": d.pin, "value": value, "current": v.get("sheet")})
+            out.append(_sheet_write(board, sh_ctx, d.pin, "signal", value, v.get("sheet")))
         out += [w for w in d.apply_to if w.get("kind") == "symbol_label"]
     elif d.field == "function":
         exp = expected_cube_label(c.get("signal"), value, c.get("cube_label"), c.get("role"), board.debug_style)
         if exp and exp != c.get("cube_label"):
             out.append({"target": "ioc", "field": "GPIO_Label", "pin": d.pin, "value": exp, "current": c.get("cube_label")})
         if value != v.get("sheet") and board.sheet:
-            out.append({"target": "sheet", "field": "function", "pin": d.pin, "value": value, "current": v.get("sheet")})
+            out.append(_sheet_write(board, sh_ctx, d.pin, "function", value, v.get("sheet")))
         if v.get("schematic") is not None and value != v.get("schematic") and c.get("schematic_net"):
             new = netnames.generate(board.prefix, c.get("pin_name") or d.pin, c.get("signal"), value, role=c.get("role"),
                                     debug_style=board.debug_style)
@@ -650,7 +651,7 @@ def writes_for(d: Diff, value, board: Board) -> List[dict]:
                         "sheets": c.get("sheets", [])})
     elif d.field == "net":
         if value != v.get("sheet") and board.sheet:
-            out.append({"target": "sheet", "field": "net", "pin": d.pin, "value": value, "current": v.get("sheet")})
+            out.append(_sheet_write(board, sh_ctx, d.pin, "net", value, v.get("sheet")))
         if c.get("schematic_net") and value != c.get("schematic_net"):
             out.append({"target": "altium", "kind": "net_label", "pin": d.pin, "from": c.get("schematic_net"), "to": value,
                         "sheets": c.get("sheets", [])})
