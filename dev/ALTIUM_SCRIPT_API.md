@@ -285,7 +285,20 @@ whole frame. The X9 sheet has ZERO `eJunction` objects although every
 pull-up drop shows a dot: Altium draws T-junctions itself, so a drop wire
 ending on another wire needs no junction object.
 
-### Compile messages are NOT reachable from a script
+### ERC IS reachable - through the report, not the panel
+
+`ResetParameters; AddStringParameter('ObjectKind','Validation');
+AddStringParameter('Kind','Electrical Rules Check'); RunProcess(
+'WorkspaceManager:GenerateReport')` compiles the focused project and writes
+the ERC report as `<project>\Project Outputs for <name>\<shown sheet>.html`
+(project-wide rows: Class | Document | Message) plus `Status Report.Txt`.
+Measured 2026-09-20. Two traps: `DisableDialog=True` is ignored - a modal
+`TERCReportSetup_Form` blocks Altium (and every later dispatch answers "another
+instance is busy") until its `TXPBitBtn` OK is pressed, and that button
+ignores BM_CLICK; WM_LBUTTONDOWN/UP posted at its centre works (`check_erc`
+does this from Python). `ObjectKind=Report|Kind=...` returns Result=0 for ERC.
+
+### Compile messages are NOT reachable from the messages panel
 
 `GetWorkspace.DM_MessagesManager` is non-nil, but `GetMessageCount` and
 `MessageCount` are undeclared on it, late-bound or through a typed
