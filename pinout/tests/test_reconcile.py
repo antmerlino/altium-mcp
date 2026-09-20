@@ -206,7 +206,14 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(by["PF10:function"].kind, "role_vs_signal")
         self.assertEqual(by["PF10:function"].apply_to, [], "the .ioc label VARIANT_SENSE is the meaning; nothing to fix")
         self.assertEqual(by["PF10:net"].kind, "convention_variant")
-        self.assertIn("MC_PF10__VARIANT_SENSE", by["PF10:net"].why)
+        self.assertEqual(by["PF10:net"].proposed, "MC_PF10__VARIANT_SENSE")
+        self.assertEqual({w["target"] for w in by["PF10:net"].apply_to}, {"sheet", "altium"})
+        self.assertEqual(rc.split_signal_for_sheet("S_TIM17_CH1"), ("TIM17", "CH1"))
+        self.assertEqual(rc.split_signal_for_sheet("RCC_MCO_1"), ("RCC", "MCO_1"))
+        self.assertEqual(rc.split_signal_for_sheet("USB_OTG_HS_ULPI_D0"), ("USB_OTG_HS", "ULPI_D0"))
+        self.assertEqual(rc.split_signal_for_sheet("DEBUG_JTMS-SWDIO"), ("DEBUG", "JTMS-SWDIO"))
+        self.assertEqual(rc.split_signal_for_sheet("ADCx_INP18"), ("ADC1", "INP18"))
+        self.assertEqual(rc.split_signal_for_sheet("FMC_A15_BA1"), ("FMC", "A15_BA1"))
 
     def test_report_rendering_and_json(self):
         text = rc.format_report(self.rep)

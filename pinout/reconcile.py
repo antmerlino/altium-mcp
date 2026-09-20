@@ -191,9 +191,25 @@ def _sheet_write(board: Board, sh: dict, key: str, role: str, value, current=Non
             if value and value.startswith("GPIO_"):
                 w["parts"] = {spec.columns["peripheral"]: "IO"}
             elif value:
-                per, _, ppin = value.partition("_")
+                per, ppin = split_signal_for_sheet(value)
                 w["parts"] = {spec.columns["peripheral"]: per, spec.columns["peripheral_pin"]: ppin}
     return w
+
+
+def split_signal_for_sheet(signal: str):
+    """A CubeMX signal as the MC sheet writes it: Peripheral + Peripheral Pin.
+    S_TIM17_CH1 -> (TIM17, CH1); RCC_MCO_1 -> (RCC, MCO_1); USB_OTG_HS_ULPI_D0 ->
+    (USB_OTG_HS, ULPI_D0); DEBUG_JTMS-SWDIO -> (DEBUG, JTMS-SWDIO); ADCx_INP18 -> (ADC1, INP18)."""
+    if signal.startswith("DEBUG_"):
+        return "DEBUG", signal[len("DEBUG_"):]
+    if signal.startswith("ADCx_"):
+        return "ADC1", signal[len("ADCx_"):]
+    body = signal[2:] if signal.startswith("S_") else signal
+    per = naming.peripheral_group(body) or body.split("_", 1)[0]
+    if body.startswith(per + "_"):
+        return per, body[len(per) + 1:]
+    head, _, rest = body.partition("_")
+    return head, rest
 
 
 def compare_pin(board: Board, key: str, ioc: dict, sh: dict, sch: dict) -> List[Diff]:
@@ -460,7 +476,9 @@ def diagnose(d: Diff, board: Board, ioc: dict, sh: dict, sch: dict, ioc_diag: di
                 alt = netnames.generate(prefix, c.get("pin_name") or d.pin, sig, label or role_word, gpio_style=True)
                 d.kind, d.suggested = "convention_variant", "decide"
                 d.why = (f"Analog pin named in the peripheral form ({v.get('sheet')}); the convention writes analog pins with the "
-                         f"meaning after a double underscore ({alt}). Choose custom = {alt!r} to normalise it, or ignore.")
+                         f"meaning after a double underscore ({alt}). Accept normalises it; ignore keeps the current name.")
+                d.proposed = alt
+                d.apply_to = writes_for(d, alt, board)
                 return
             if label and role_word and label.startswith(role_word):
                 d.kind, d.suggested = "role_vs_signal", "ignore"
