@@ -29,7 +29,7 @@ var
     I1, I2, I3, I4, I5, I6, I7, I8, I9 : Integer;
     B1, B2, B3 : Integer;
     F1, F2, F3, F4 : Double;
-    Obj1, Obj2, Obj3, Obj4, Obj5, Obj6, Obj7, Obj8, Obj9 : IDispatch;
+    Obj1, Obj2, Obj3, Obj4, Obj5, Obj6, Obj7, Obj8, Obj9, Obj10, Obj11, Obj12 : IDispatch;
     List1, List2, List3 : TStringList;
     IntMan     : IIntegratedLibraryManager;
     DbDoc      : IDatabaseLibDocument;
@@ -182,6 +182,177 @@ begin
         D.SetModified(True);
         D.DoFileSave('');
     end;
+end;
+
+// Data that must survive a late failure: logged with the "EMIT: " prefix (the log is flushed on every
+// line); the schematic tools get the lines back as "emitted" even when the script dies later.
+procedure SandboxEmit(Line: String);
+begin
+    SandboxLog('EMIT: ' + Line);
+end;
+
+// ---- helpers for the patterns every sheet script repeats -------------------
+// All verified live on Altium Designer (X2.EXE) 2026-09-19/20.
+
+// The sheet to work on: by full path when given (open, not necessarily
+// focused), else the focused schematic. nil when neither is available.
+function SbDoc(Path: String): IDispatch;
+begin
+    if Path = '' then Result := SchServer.GetCurrentSchDocument
+    else Result := SchServer.GetSchDocumentByPath(Path);
+end;
+
+procedure SbBeginModify(O: IDispatch);
+begin
+    SchServer.RobotManager.SendMessage(O.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+end;
+
+procedure SbEndModify(O: IDispatch);
+begin
+    SchServer.RobotManager.SendMessage(O.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+end;
+
+// Put a new (or replicated) object on the sheet.
+procedure SbRegister(Doc, O: IDispatch);
+begin
+    Doc.RegisterSchObjectInContainer(O);
+    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, O.I_ObjectAddress);
+end;
+
+// Remove an object from the sheet. Never call this while iterating the
+// sheet - find the object, destroy the iterator, then remove.
+procedure SbRemove(Doc, O: IDispatch);
+begin
+    Doc.RemoveSchObject(O);
+    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, O.I_ObjectAddress);
+end;
+
+// MoveByXY carries children (a directive's hidden parameters, a component's
+// pins, a connector's entries); assigning Location does not.
+procedure SbMove(O: IDispatch; DX, DY: Integer);
+begin
+    SbBeginModify(O);
+    O.MoveByXY(DX, DY);
+    SbEndModify(O);
+end;
+
+// The identifying text of an object, by kind: Text for labels/power ports,
+// Designator.Text for components, HarnessType for harness connectors, Name
+// for ports / directives / entries, '' otherwise.
+function SbIdent(O: IDispatch): String;
+begin
+    Result := '';
+    if (O.ObjectId = eNetLabel) or (O.ObjectId = ePowerObject) or (O.ObjectId = eLabel) then Result := O.Text
+    else if O.ObjectId = eSchComponent then Result := O.Designator.Text
+    else if O.ObjectId = eHarnessConnector then Result := O.HarnessType
+    else if (O.ObjectId = ePort) or (O.ObjectId = eParameterSet) or (O.ObjectId = eHarnessEntry) then Result := O.Name;
+end;
+
+// First object of kind ObjId whose identifying text is Ident (any if '') and
+// whose Location is (X, Y) (either -1 to ignore). nil when nothing matches.
+// The iterator is destroyed before returning, so the result is safe to
+// modify or remove.
+function SbFind(Doc: IDispatch; ObjId: Integer; Ident: String; X, Y: Integer): IDispatch;
+var
+    It, O : IDispatch;
+begin
+    Result := nil;
+    It := Doc.SchIterator_Create;
+    It.AddFilter_ObjectSet(MkSet(ObjId));
+    O := It.FirstSchObject;
+    while (O <> nil) and (Result = nil) do
+    begin
+        if ((Ident = '') or (SbIdent(O) = Ident)) and ((X < 0) or (O.Location.X = X)) and ((Y < 0) or (O.Location.Y = Y)) then
+            Result := O;
+        O := It.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(It);
+end;
+
+// How many objects of kind ObjId the sheet holds.
+function SbCount(Doc: IDispatch; ObjId: Integer): Integer;
+var
+    It, O : IDispatch;
+begin
+    Result := 0;
+    It := Doc.SchIterator_Create;
+    It.AddFilter_ObjectSet(MkSet(ObjId));
+    O := It.FirstSchObject;
+    while O <> nil do
+    begin
+        Result := Result + 1;
+        O := It.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(It);
+end;
+
+// Copy an object (children included), shift the copy, register it.
+function SbReplicateMove(Doc, O: IDispatch; DX, DY: Integer): IDispatch;
+begin
+    Result := O.Replicate;
+    Result.MoveByXY(DX, DY);
+    SbRegister(Doc, Result);
+end;
+
+// A two-point wire. eCreate_Default, never eCreate_GlobalCopy (that clones
+// the last-edited wire's vertices).
+function SbWire(Doc: IDispatch; X1, Y1, X2, Y2: Integer): IDispatch;
+begin
+    Result := SchServer.SchObjectFactory(eWire, eCreate_Default);
+    Result.Location := Point(X1, Y1);
+    Result.InsertVertex := 1;
+    Result.SetState_Vertex(1, Point(X1, Y1));
+    Result.InsertVertex := 2;
+    Result.SetState_Vertex(2, Point(X2, Y2));
+    SbRegister(Doc, Result);
+end;
+
+// A net label; names a net only when (X, Y) lies on a wire.
+function SbNetLabel(Doc: IDispatch; Text: String; X, Y, Orientation: Integer): IDispatch;
+begin
+    Result := SchServer.SchObjectFactory(eNetLabel, eCreate_Default);
+    Result.Text := Text;
+    Result.Location := Point(X, Y);
+    Result.Orientation := Orientation;
+    SbRegister(Doc, Result);
+end;
+
+// A directive (parameter set): visible Name plus one hidden parameter, e.g.
+// ('MC_SPI6', ..., 'ClassName', 'MC_SPI6'). Style 1 draws the house circle.
+function SbDirective(Doc: IDispatch; Name: String; X, Y, Orientation, Color, Style: Integer; ParamName, ParamText: String): IDispatch;
+var
+    P : IDispatch;
+begin
+    Result := SchServer.SchObjectFactory(eParameterSet, eCreate_Default);
+    Result.Name := Name;
+    Result.Location := Point(X, Y);
+    Result.Orientation := Orientation;
+    Result.Color := Color;
+    Result.Style := Style;
+    P := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+    P.Name := ParamName;
+    P.Text := ParamText;
+    P.IsHidden := True;
+    Result.AddSchObject(P);
+    SbRegister(Doc, Result);
+end;
+
+// A port in the house colours; HarnessType '' for a plain port.
+function SbPort(Doc: IDispatch; Name, HarnessType: String; X, Y, Width: Integer): IDispatch;
+begin
+    Result := SchServer.SchObjectFactory(ePort, eCreate_Default);
+    Result.Location := Point(X, Y);
+    Result.Name := Name;
+    if HarnessType <> '' then Result.HarnessType := HarnessType;
+    Result.Width := Width;
+    Result.Height := 1000000;
+    Result.Style := 0;
+    Result.Alignment := 0;
+    Result.Color := 128;
+    Result.AreaColor := 8454143;
+    Result.TextColor := 128;
+    Result.FontID := 1;
+    SbRegister(Doc, Result);
 end;
 
 procedure Run;

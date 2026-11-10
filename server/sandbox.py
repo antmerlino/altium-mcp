@@ -63,7 +63,7 @@ VARS_INDENT = " " * 4
 TEMPLATE_NAMES = (
     ["S%d" % i for i in range(1, 10)] + ["I%d" % i for i in range(1, 10)]
     + ["B1", "B2", "B3", "F1", "F2", "F3", "F4"]
-    + ["Obj%d" % i for i in range(1, 10)] + ["List1", "List2", "List3"]
+    + ["Obj%d" % i for i in range(1, 13)] + ["List1", "List2", "List3"]
     + ["IntMan", "DbDoc", "ResultText", "LogLines", "LogPath", "OutPath", "OutLines"]
 )
 
