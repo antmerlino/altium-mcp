@@ -32,6 +32,62 @@ PIN_KEY = re.compile(r"^([^.]+)\.(Signal|Mode|GPIO_Label|Locked|GPIOParameters)$
 # everywhere in this module; the escaping exists only on the line in the file.
 _KEY_ESCAPES = {" ": "\\ ", "=": "\\=", ":": "\\:", "\\": "\\\\"}
 
+# An EXTI input on line n is `<pin>.Signal=GPXTIn`, but that key alone is not
+# what CubeMX writes. It also binds the signal to its GPIO function,
+#     SH.GPXTIn.0=GPIO_EXTIn
+#     SH.GPXTIn.ConfNb=1
+# and without the binding it treats the line as unconfigured: on load it warns
+# and forces the GPIO mode, on save it writes ConfNb=0 and DROPS the NVIC
+# vector, so the interrupt silently ends up disabled. Every EXTI pin in the
+# 6.x board files CubeMX ships (153 of them) carries the binding. Found on the
+# X9 Mission Computer .ioc, 2026-09-22: use set_exti(), never the raw keys.
+EXTI_EDGES = {
+    "rising": "GPIO_MODE_IT_RISING",
+    "falling": "GPIO_MODE_IT_FALLING",
+    "both": "GPIO_MODE_IT_RISING_FALLING",
+}
+# Enabled, preemption 0, sub 0: the most common EXTI vector value in the board
+# files CubeMX ships. Values are written verbatim, backslashes included.
+EXTI_NVIC_ENABLED = r"true\:0\:0\:false\:false\:true\:true\:true\:true"
+# How a family maps EXTI lines onto NVIC vectors. Only layouts checked against
+# CubeMX output are listed (its board files, and its own H7 load warnings
+# naming EXTI1 / EXTI2 / EXTI9_5 / EXTI15_10); any other family must pass the
+# vector explicitly rather than have one guessed.
+_EXTI_VECTOR_STYLE = {
+    "STM32F1": "grouped", "STM32F4": "grouped", "STM32G4": "grouped",
+    "STM32H7": "grouped", "STM32L4": "grouped", "STM32WB": "grouped",
+    "STM32C0": "paired", "STM32L0": "paired",
+    "STM32U3": "per_line", "STM32U5": "per_line", "STM32WBA": "per_line",
+}
+_PIN_LINE = re.compile(r"^P[A-K](\d{1,2})(?!\d)")
+
+
+def exti_line(pin: str) -> int:
+    """The EXTI line a pin can drive: its pin number (PC7 and PG7 -> 7)."""
+    m = _PIN_LINE.match(pin)
+    if not m or int(m.group(1)) > 15:
+        raise ValueError(f"not a GPIO port pin: {pin!r}")
+    return int(m.group(1))
+
+
+def exti_vector(line: int, family: Optional[str]) -> str:
+    """NVIC vector name serving EXTI `line` on `family` (the file's Mcu.Family)."""
+    style = _EXTI_VECTOR_STYLE.get(family or "")
+    if style == "grouped":
+        name = f"EXTI{line}" if line < 5 else ("EXTI9_5" if line < 10 else "EXTI15_10")
+    elif style == "paired":
+        name = "EXTI0_1" if line < 2 else ("EXTI2_3" if line < 4 else "EXTI4_15")
+    elif style == "per_line":
+        name = f"EXTI{line}"
+    else:
+        raise ValueError(f"EXTI vector layout for {family!r} is not known; pass vector= explicitly")
+    return name + "_IRQn"
+
+
+def _signal_line(signal: Optional[str]) -> Optional[int]:
+    m = re.fullmatch(r"GPXTI(\d{1,2})", signal or "")
+    return int(m.group(1)) if m else None
+
 
 def escape_key(key: str) -> str:
     return "".join(_KEY_ESCAPES.get(c, c) for c in key)
@@ -78,7 +134,9 @@ class IocFile:
     # ---- file level ------------------------------------------------------
     @classmethod
     def load(cls, path) -> "IocFile":
-        return cls(Path(path).read_text(encoding="utf-8"))
+        # bytes, not read_text(): text mode turns CRLF into LF on the way in,
+        # and save() would then hand CubeMX its own file back with LF endings
+        return cls(Path(path).read_bytes().decode("utf-8"))
 
     def text(self) -> str:
         body = self._eol.join(self._lines)
@@ -201,6 +259,8 @@ class IocFile:
         """Assign or update a pin. Pass None to leave a field alone, "" to clear it."""
         if not (is_physical_pin(pin) or is_virtual_pin(pin)):
             raise ValueError(f"not a CubeMX pin name: {pin!r}")
+        if signal is not None and signal != self.get(f"{pin}.Signal"):
+            self._release_exti(pin)
         if signal is not None:
             self.set(f"{pin}.Signal", signal) if signal else self.delete(f"{pin}.Signal")
         if mode is not None:
@@ -217,11 +277,93 @@ class IocFile:
         self._sync_pin_list()
 
     def clear_pin(self, pin: str) -> None:
+        self._release_exti(pin)
         for field in ("Signal", "Mode", "GPIO_Label", "Locked", "GPIOParameters"):
             self.delete(f"{pin}.{field}")
         for key in self.keys(f"{pin}.GPIO_"):
             self.delete(key)
         self._sync_pin_list()
+
+    # ---- EXTI --------------------------------------------------------------
+    def set_exti(self, pin: str, edge: str = "rising", label: Optional[str] = None,
+                 nvic: bool = True, vector: Optional[str] = None) -> None:
+        """Make `pin` an external-interrupt input exactly as CubeMX writes one.
+
+        Writes the signal, the explicit edge, the SH.GPXTIn binding and, with
+        nvic=True, enables the vector - leaving an existing vector entry (and
+        any priority set on it) alone. Refuses a line another pin already
+        holds: EXTI line n serves pin n of ONE port only.
+        """
+        if edge not in EXTI_EDGES:
+            raise ValueError(f"edge must be one of {sorted(EXTI_EDGES)}, not {edge!r}")
+        n = exti_line(pin)
+        for other, a in self.pins().items():
+            if other != pin and _signal_line(a.signal) == n:
+                raise ValueError(f"EXTI line {n} is already used by {other}; {pin} cannot have it too")
+        key = "NVIC." + (vector or exti_vector(n, self.get("Mcu.Family"))) if nvic else None
+        self.set_pin(pin, signal=f"GPXTI{n}", label=label, locked=True)
+        self.set(f"{pin}.GPIO_ModeDefaultEXTI", EXTI_EDGES[edge])
+        self._add_gpio_parameter(pin, "GPIO_ModeDefaultEXTI")
+        self.set(f"SH.GPXTI{n}.0", f"GPIO_EXTI{n}")
+        self.set(f"SH.GPXTI{n}.ConfNb", "1")
+        if key and self.get(key) is None:
+            self.set(key, EXTI_NVIC_ENABLED)
+
+    def _release_exti(self, pin: str) -> None:
+        """Undo the side keys set_exti wrote, once `pin` stops being an EXTI input."""
+        n = _signal_line(self.get(f"{pin}.Signal"))
+        if n is None:
+            return
+        self.delete(f"{pin}.GPIO_ModeDefaultEXTI")
+        self._remove_gpio_parameter(pin, "GPIO_ModeDefaultEXTI")
+        for key in self.keys(f"SH.GPXTI{n}."):
+            self.delete(key)
+        family = self.get("Mcu.Family")
+        try:
+            vec = exti_vector(n, family)
+        except ValueError:
+            return                      # unknown layout: the caller owns NVIC
+        others = [m for p, a in self.pins().items()
+                  if p != pin and (m := _signal_line(a.signal)) is not None]
+        if not any(exti_vector(m, family) == vec for m in others):
+            self.delete(f"NVIC.{vec}")
+
+    # ---- consistency -----------------------------------------------------
+    def check(self) -> List[str]:
+        """Problems CubeMX would silently 'repair' on its next load or save.
+
+        Empty is necessary, not sufficient: pinout.cubemx.roundtrip() asks
+        CubeMX itself. Run both before handing a hand-edited .ioc to anyone.
+        """
+        problems: List[str] = []
+        family = self.get("Mcu.Family")
+        holders: Dict[int, str] = {}
+        for pin, a in self.pins().items():
+            n = _signal_line(a.signal)
+            if n is None:
+                continue
+            if n in holders:
+                problems.append(f"EXTI line {n} is on both {holders[n]} and {pin}; one port per line")
+            holders[n] = pin
+            if (self.get(f"SH.GPXTI{n}.0") != f"GPIO_EXTI{n}"
+                    or self.get(f"SH.GPXTI{n}.ConfNb") != "1"):
+                problems.append(f"{pin} is GPXTI{n} without SH.GPXTI{n}.0=GPIO_EXTI{n} / "
+                                f"SH.GPXTI{n}.ConfNb=1: CubeMX forces its mode on load and "
+                                f"drops its NVIC vector on save")
+        try:
+            used = {exti_vector(n, family) for n in holders}
+            for key in self.keys("NVIC.EXTI"):
+                if key[len("NVIC."):] not in used:
+                    problems.append(f"{key} is set but no EXTI pin uses it; CubeMX drops it on save")
+        except ValueError:
+            pass                        # unknown vector layout: cannot judge NVIC keys
+        listed = self.pin_list()
+        assigned = {p for p, a in self.pins(include_virtual=True).items() if a.signal}
+        if self.get("Mcu.PinsNb") != str(len(listed)):
+            problems.append(f"Mcu.PinsNb={self.get('Mcu.PinsNb')} but Mcu.PinN lists {len(listed)} pins")
+        problems += [f"{p} has a Signal but is missing from Mcu.PinN" for p in sorted(assigned - set(listed))]
+        problems += [f"{p} is in Mcu.PinN but has no Signal" for p in sorted(set(listed) - assigned)]
+        return problems
 
     def _add_gpio_parameter(self, pin: str, param: str) -> None:
         key = f"{pin}.GPIOParameters"

@@ -14,7 +14,8 @@ project.ioc          --ioc----->  /       ^  |                      |
 
 | Module | Purpose |
 |---|---|
-| `ioc.py` | Read and **modify** a CubeMX `.ioc` - only the pin keys move; everything CubeMX owns round-trips byte for byte, and `Mcu.PinN`/`Mcu.PinsNb` stay consistent. Handles the spellings real H7 files use: `.properties` key escaping (`PA13\ (JTMS/SWDIO).Signal`), `PC2_C`, `PH0-OSC_IN (PH0)`; keeps CubeMX's ball-position order of `Mcu.PinN`. |
+| `ioc.py` | Read and **modify** a CubeMX `.ioc` - only the pin keys move; everything CubeMX owns round-trips byte for byte, and `Mcu.PinN`/`Mcu.PinsNb` stay consistent. Handles the spellings real H7 files use: `.properties` key escaping (`PA13\ (JTMS/SWDIO).Signal`), `PC2_C`, `PH0-OSC_IN (PH0)`; keeps CubeMX's ball-position order of `Mcu.PinN`; preserves CRLF through `load()`/`save()`. `set_exti(pin, edge, label)` writes an interrupt pin the way CubeMX does (signal, edge, the `SH.GPXTIn` binding, the NVIC vector for the family) and refuses a line another port holds; `check()` lists what CubeMX would silently "repair" on its next load or save. |
+| `cubemx.py` | Ask CubeMX itself: `roundtrip(ioc, baseline=original)` loads and saves a temporary copy **headless** and reports every key CubeMX added, removed or changed, minus what it also does to the untouched original. `python -m pinout.cubemx edited.ioc --baseline original.ioc` runs `check()` and the round trip; exit 1 if CubeMX threw anything away. Finds the newest install (old ones refuse newer files); ~45 s per run. |
 | `mcu_db.py` | The authoritative pin table from CubeMX's own MCU XML: every pin, its package position, its type, every alternate signal. |
 | `model.py` | The canonical `Pinout`: MCU DB + `.ioc` + **designer-owned columns** (function, group, part, net) that survive regeneration. JSON primary; XLSX optional via openpyxl. |
 | `naming.py` | House rules measured from the library: `EMBEDDED_IC_<MPN>_<BOARD>`, `PREFIX_PIN_SIGNAL__FUNCTION` net labels, `PA13 (JTMS/SWDIO)`, electrical types derived per signal. Peripheral grouping for G4 (`SYS_JT*`) and H7 (`DEBUG_*`, `ADCx_*`, `USB_OTG_HS_*`) signal names; `canonical_group` folds hand-written labels (QSPI, OTGFS, UART6, OTG_ULPI) onto CubeMX's names. |
@@ -53,5 +54,16 @@ The spreadsheet round-trip test skips unless `openpyxl` is installed.
   written is trusted until it has been read back (`get_symbol_primitives`)
   and compared (`verify.compare`) against the spec that produced it. A tool reporting success once drew
   nothing at all; only the render showed it.
+- **An edited `.ioc` is not handed over until CubeMX has round-tripped it.**
+  Edit through `IocFile` only (never ad-hoc scripts), then run
+  `python -m pinout.cubemx edited.ioc --baseline original.ioc` and require
+  "no changes". CubeMX repairs files silently: an EXTI pin written as just
+  `Signal=GPXTIn` loaded with GUI warnings, and CubeMX then saved it with
+  `SH.GPXTIn.ConfNb=0` and every NVIC vector dropped, so the interrupts came
+  up disabled (X9 Mission Computer, 2026-09-22). Its headless mode logs none
+  of those warnings; only the saved file shows them.
+- **Syncing an `.ioc` to a schematic changes GPIO only.** Peripherals and
+  their pins stay, even when the board leaves them unconnected - report
+  those, never remove them.
 - Coordinates are mils, y up, 100-mil pitch. Pin length is a parameter
   (200 in the G431 symbols, 300 in the H753 ones).

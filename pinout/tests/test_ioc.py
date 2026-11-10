@@ -1,10 +1,12 @@
 """IocFile: read, modify and round-trip a CubeMX .ioc without collateral damage."""
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from pinout.ioc import IocFile, is_physical_pin, is_virtual_pin  # noqa: E402
+from pinout.ioc import (EXTI_NVIC_ENABLED, IocFile, exti_line, exti_vector,  # noqa: E402
+                        is_physical_pin, is_virtual_pin)
 
 FIX = Path(__file__).parent / "fixtures" / "fake_board.ioc"
 
@@ -209,6 +211,132 @@ class RealWorldKeyFormsTest(unittest.TestCase):
         self.assertEqual(self.ioc.pin_list(),
                          ["PE3", "PA13 (JTMS/SWDIO)", "PC2_C", "PB0", "VP_SYS_VS_Systick"])
         self.assertNotIn("PH0-OSC_IN\\ (PH0).Signal=RCC_OSC_IN", self.ioc.text().split("\n"))
+
+
+class LoadFromDiskTest(unittest.TestCase):
+    """test_crlf_preserved builds the file from a string; this goes through
+    load(), where text-mode reading once turned every CRLF into LF."""
+
+    def test_crlf_file_round_trips_byte_identical(self):
+        data = FIX.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp, "in.ioc"), Path(tmp, "out.ioc")
+            src.write_bytes(data)
+            IocFile.load(src).save(dst)
+            self.assertEqual(dst.read_bytes(), data)
+
+
+EXTI_SNIPPET = "\r\n".join([
+    "#MicroXplorer Configuration settings - do not modify",
+    "Mcu.Family=STM32H7",
+    "Mcu.Name=STM32H753XIHx",
+    "Mcu.Pin0=PC7",
+    "Mcu.Pin1=PG7",
+    "Mcu.Pin2=PI10",
+    "Mcu.Pin3=VP_SYS_VS_Systick",
+    "Mcu.PinsNb=4",
+    "NVIC.SysTick_IRQn=true\\:0\\:0\\:false\\:false\\:true\\:false\\:true\\:false",
+    "PC7.GPIOParameters=GPIO_Label",
+    "PC7.GPIO_Label=WIFI_IRQ",
+    "PC7.Locked=true",
+    "PC7.Signal=GPIO_Input",
+    "PG7.Signal=GPIO_Input",
+    "PI10.Signal=GPIO_Input",
+    "VP_SYS_VS_Systick.Mode=SysTick",
+    "VP_SYS_VS_Systick.Signal=SYS_VS_Systick",
+    "",
+])
+
+
+class ExtiTest(unittest.TestCase):
+    """EXTI pins need the SH.GPXTIn binding CubeMX writes. Without it CubeMX
+    forced the GPIO mode on load and dropped every NVIC vector on save - the
+    X9 Mission Computer .ioc, 2026-09-22."""
+
+    def setUp(self):
+        self.ioc = IocFile(EXTI_SNIPPET)
+
+    def test_vector_layouts(self):
+        self.assertEqual([exti_vector(n, "STM32H7") for n in (0, 4, 5, 9, 10, 15)],
+                         ["EXTI0_IRQn", "EXTI4_IRQn", "EXTI9_5_IRQn", "EXTI9_5_IRQn",
+                          "EXTI15_10_IRQn", "EXTI15_10_IRQn"])
+        self.assertEqual([exti_vector(n, "STM32L0") for n in (1, 2, 4, 15)],
+                         ["EXTI0_1_IRQn", "EXTI2_3_IRQn", "EXTI4_15_IRQn", "EXTI4_15_IRQn"])
+        self.assertEqual(exti_vector(13, "STM32U5"), "EXTI13_IRQn")
+        with self.assertRaises(ValueError):
+            exti_vector(3, "STM32MP1")      # unverified layout: never guessed
+
+    def test_line_from_pin_name(self):
+        self.assertEqual(exti_line("PC7"), 7)
+        self.assertEqual(exti_line("PC14-OSC32_IN (OSC32_IN)"), 14)
+        self.assertEqual(exti_line("PA13 (JTMS/SWDIO)"), 13)
+
+    def test_set_exti_writes_what_cubemx_writes(self):
+        self.ioc.set_exti("PC7", edge="falling")
+        self.assertEqual(self.ioc.get("PC7.Signal"), "GPXTI7")
+        self.assertEqual(self.ioc.get("PC7.GPIO_ModeDefaultEXTI"), "GPIO_MODE_IT_FALLING")
+        self.assertEqual(self.ioc.get("PC7.GPIOParameters"), "GPIO_Label,GPIO_ModeDefaultEXTI")
+        self.assertEqual(self.ioc.get("PC7.GPIO_Label"), "WIFI_IRQ", "label kept")
+        self.assertEqual(self.ioc.get("SH.GPXTI7.0"), "GPIO_EXTI7")
+        self.assertEqual(self.ioc.get("SH.GPXTI7.ConfNb"), "1")
+        self.assertEqual(self.ioc.get("NVIC.EXTI9_5_IRQn"), EXTI_NVIC_ENABLED)
+        self.assertEqual(self.ioc.check(), [])
+        self.assertTrue(self.ioc.text().endswith("\r\n") and "\n" not in self.ioc.text().replace("\r\n", ""))
+
+    def test_existing_vector_priority_is_kept(self):
+        self.ioc.set("NVIC.EXTI15_10_IRQn", "true\\:5\\:0\\:false\\:false\\:true\\:true\\:true\\:true")
+        self.ioc.set_exti("PI10")
+        self.assertTrue(self.ioc.get("NVIC.EXTI15_10_IRQn").startswith("true\\:5"))
+
+    def test_one_port_per_line(self):
+        self.ioc.set_exti("PC7")
+        with self.assertRaisesRegex(ValueError, "already used by PC7"):
+            self.ioc.set_exti("PG7")
+        self.assertEqual(self.ioc.get("PG7.Signal"), "GPIO_Input", "refused before touching anything")
+
+    def test_unknown_family_refuses_before_writing(self):
+        ioc = IocFile(EXTI_SNIPPET.replace("Mcu.Family=STM32H7", "Mcu.Family=STM32MP1"))
+        with self.assertRaises(ValueError):
+            ioc.set_exti("PC7")
+        self.assertEqual(ioc.get("PC7.Signal"), "GPIO_Input")
+        ioc.set_exti("PC7", vector="EXTI7_IRQn")
+        self.assertEqual(ioc.get("NVIC.EXTI7_IRQn"), EXTI_NVIC_ENABLED)
+
+    def test_back_to_gpio_releases_binding_and_last_vector_user(self):
+        self.ioc.set_exti("PC7")
+        self.ioc.set_pin("PC7", signal="GPIO_Input")
+        self.assertIsNone(self.ioc.get("PC7.GPIO_ModeDefaultEXTI"))
+        self.assertEqual(self.ioc.get("PC7.GPIOParameters"), "GPIO_Label")
+        self.assertEqual(self.ioc.keys("SH.GPXTI7."), [])
+        self.assertIsNone(self.ioc.get("NVIC.EXTI9_5_IRQn"))
+        self.assertEqual(self.ioc.check(), [])
+
+    def test_shared_vector_survives_while_another_pin_uses_it(self):
+        self.ioc.set_exti("PC7")                    # line 7 -> EXTI9_5
+        self.ioc.set_exti("PE8", label="UWB_IRQ")   # line 8 -> EXTI9_5 too; new pin
+        self.assertIn("PE8", self.ioc.pin_list())
+        self.ioc.clear_pin("PC7")
+        self.assertEqual(self.ioc.get("NVIC.EXTI9_5_IRQn"), EXTI_NVIC_ENABLED, "PE8 still uses it")
+        self.assertEqual(self.ioc.keys("SH.GPXTI7."), [])
+        self.assertEqual(self.ioc.get("SH.GPXTI8.ConfNb"), "1")
+        self.ioc.set_pin("PE8", signal="GPIO_Input")
+        self.assertIsNone(self.ioc.get("NVIC.EXTI9_5_IRQn"), "last user of the vector gone")
+        self.assertEqual(self.ioc.check(), [])
+
+    def test_check_flags_the_x9_failure(self):
+        # exactly what was handed to CubeMX: a GPXTI signal and a vector, no binding
+        self.ioc.set_pin("PC7", signal="GPXTI7")
+        self.ioc.set("NVIC.EXTI9_5_IRQn", EXTI_NVIC_ENABLED)
+        problems = self.ioc.check()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("PC7 is GPXTI7 without SH.GPXTI7.0", problems[0])
+
+    def test_check_flags_orphan_vector_and_pin_list(self):
+        self.ioc.set("NVIC.EXTI2_IRQn", EXTI_NVIC_ENABLED)
+        self.ioc.set("Mcu.PinsNb", "9")
+        problems = self.ioc.check()
+        self.assertTrue(any("NVIC.EXTI2_IRQn is set but no EXTI pin uses it" in p for p in problems))
+        self.assertTrue(any("Mcu.PinsNb=9" in p for p in problems))
 
 
 if __name__ == "__main__":

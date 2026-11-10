@@ -1,0 +1,2 @@
+# CubeMX .ioc files are compared and round-tripped byte for byte (pinout/ioc.py): never convert their line endings.
+*.ioc -text
