@@ -31,6 +31,21 @@ import pcblib_file
 import uuid
 
 from altium_files import long_path, read_altium_text, spec_with_long_library, write_altium_text
+import base64
+import ctypes
+from typing import Union
+
+# Windows virtualizes coordinates for DPI-unaware processes, so GetWindowRect reports a window SMALLER than it
+# really is on any scaled display and every capture comes back truncated - which silently cut the error text
+# off Altium's dialog screenshots. Declare awareness before any window is measured.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 from exchange_lock import ExchangeLock
 from altium_install import find_altium_exe
 import routing
@@ -1023,6 +1038,7 @@ async def search_library_symbol(ctx: Context, symbol_name: str, library_path: st
     Returns:
         str: JSON object with search results including matches, navigated symbol, and full symbol list
     """
+    library_path = _canon(library_path)
     logger.info(f"Searching for symbol: {symbol_name} in library: {library_path or '(current)'}")
 
     # Execute the command in Altium
@@ -6735,6 +6751,309 @@ async def get_server_status(ctx: Context) -> str:
     }
     
     return json.dumps(status, indent=2)
+
+
+
+# ---- Verge local tools on upstream's sandbox ----------------------------------------------------------------
+# These tools were written against the local branch's own sandbox runner. They run their DelphiScript through
+# run_altium_script, so they inherit upstream's pre-run checks, loop guard, undo-group closing and Altium-only
+# dialog handling. SandboxEmit lines (logged with this prefix) come back as "emitted".
+SANDBOX_EMIT_PREFIX = "EMIT: "
+
+
+async def _run_sandbox(script: str, timeout_seconds: int = 120):
+    """Run a DelphiScript body in the sandbox for the local tools. Returns (payload_dict, images)."""
+    raw = await run_altium_script(None, script, timeout_seconds)
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {"success": False, "error": str(raw)}, []
+    steps = payload.get("steps") or []
+    emitted = [s[len(SANDBOX_EMIT_PREFIX):] for s in steps if s.startswith(SANDBOX_EMIT_PREFIX)]
+    if emitted:
+        payload["emitted"] = emitted
+        payload["steps"] = [s for s in steps if not s.startswith(SANDBOX_EMIT_PREFIX)]
+    images = []
+    for p in payload.get("dialog_snapshots") or []:
+        try:
+            images.append(base64.b64encode(Path(p).read_bytes()).decode("ascii"))
+        except OSError:
+            pass
+    return payload, images
+
+def _sandbox_return(payload, images):
+    """Return JSON alone, or JSON plus the dialog screenshots as image content."""
+    text = json.dumps(payload, indent=2)
+    if not images:
+        return text
+    return [text] + [MCPImage(data=base64.b64decode(p), format="png") for p in images]
+
+
+def _canon(path):
+    """The one spelling Altium recognises: absolute, Windows backslashes.
+
+    Client.IsDocumentOpen and GetDocumentByPath compare the path STRING. A
+    forward-slash spelling of a document that is open under backslashes is
+    "not open", so OpenDocument loads a SECOND instance of the same file from
+    disk - measured: two live copies of one .SchLib with different contents,
+    one per spelling. Every path handed to Altium goes through here.
+    """
+    if not path:
+        return path
+    return str(Path(str(path)).resolve()) if Path(str(path)).exists() else         str(Path(str(path))).replace("/", "\\")
+
+
+def _pas_str(value) -> str:
+    """A DelphiScript string literal - single quotes are doubled to escape."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+_NEW_LIB_PAS = """List1 := TStringList.Create;
+SandboxLog('Client.OpenNewDocument SCHLIB');
+Obj2 := Client.OpenNewDocument('SCHLIB', '__NAME__', '__DESC__', False);
+if Obj2 = nil then
+    List1.Add('ERR|OpenNewDocument returned nil')
+else
+begin
+    Client.ShowDocument(Obj2);
+    Sleep(800);
+    SandboxLog('DoSafeChangeFileNameAndSave -> __PATH__');
+    B1 := 0;
+    if Obj2.DoSafeChangeFileNameAndSave('__PATH__', 'SCHLIB') then B1 := 1;
+    List1.Add('saved|' + IntToStr(B1));
+    Obj1 := SchServer.GetCurrentSchDocument;
+    if Obj1 <> nil then
+        List1.Add('current|' + Obj1.DocumentName + '|' + IntToStr(Obj1.ObjectId));
+end;
+ResultText := List1.Text;"""
+
+
+@_tool()
+async def create_symbol_library(ctx: Context, path: str, description: str = "",
+                                timeout_seconds: int = 120) -> str:
+    """
+    Create a NEW, empty schematic library (.SchLib) at a path, saved and
+    focused, with no dialogs.
+
+    This is the reliable way to get a library to generate symbols into.
+    Verified on AD Develop: Client.OpenNewDocument('SCHLIB', ...) followed by
+    IServerDocument.DoSafeChangeFileNameAndSave(path, 'SCHLIB'). Two dead
+    ends are recorded so they are not retried: DM_CreateNewDocument fails
+    with a variant-type error, and the process WorkspaceManager:OpenObject
+    opens a "Choose Document to Open" file chooser rather than creating.
+
+    The new library becomes the focused document, which is what
+    create_schematic_symbol requires. It is created with Altium's default
+    empty "Component_1"; that is normal.
+
+    Refuses to overwrite an existing file.
+
+    Args:
+        path (str): where to save it; must end in .SchLib.
+        description (str): document description shown in Altium.
+        timeout_seconds (int): how long to wait for Altium.
+
+    Returns:
+        str: JSON with the saved path and the focused document.
+    """
+    target = _canon(path)
+    if not target.lower().endswith(".schlib"):
+        return json.dumps({"success": False, "error": "path must end in .SchLib"})
+    if Path(target).exists():
+        return json.dumps({"success": False, "error": f"refusing to overwrite {target}"})
+    Path(target).parent.mkdir(parents=True, exist_ok=True)
+    name = Path(target).name
+    script = (_NEW_LIB_PAS.replace("__NAME__", _pas_str(name)[1:-1])
+              .replace("__DESC__", _pas_str(description or name)[1:-1])
+              .replace("__PATH__", _pas_str(target)[1:-1]))
+    logger.info(f"create_symbol_library: {target}")
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    res = payload.get("result") or ""
+    saved = "saved|1" in res
+    current = next((l.split("|")[1:] for l in res.splitlines() if l.startswith("current|")), None)
+    return json.dumps({"success": saved and Path(target).exists(),
+                       "path": target, "on_disk": Path(target).exists(),
+                       "focused": {"name": current[0], "object_id": int(current[1])} if current else None,
+                       "raw": res}, indent=2)
+
+
+def _hex6(v) -> str:
+    """Normalise a colour argument to 'RRGGBB'.
+
+    MCP TRAP (mcp 1.5.0, FuncMetadata.pre_parse_json): every string argument
+    is tried as JSON first, and only a result that is itself a string is
+    skipped. So the hex colour "800000" reaches the tool as the INTEGER
+    800000 while "FFFFFF" (not JSON) and "000000" (leading zero, invalid
+    JSON) stay strings. An all-digit colour therefore has to be accepted as
+    an int and its decimal digits read back verbatim - zero-padded, since a
+    leading zero is the one thing the round trip cannot drop (it never parses).
+    """
+    if isinstance(v, bool):
+        raise ValueError(f"colour must be RRGGBB hex, got {v!r}")
+    if isinstance(v, int):
+        if not 0 <= v <= 999999:
+            raise ValueError(f"colour must be RRGGBB hex, got {v!r}")
+        h = f"{v:06d}"
+    else:
+        h = str(v).strip().lstrip("#").upper()
+    if len(h) != 6 or any(c not in "0123456789ABCDEF" for c in h):
+        raise ValueError(f"colour must be RRGGBB hex, got {v!r}")
+    return h
+
+
+def _hex_to_bgr(h) -> int:
+    """'RRGGBB' (or the int the MCP layer made of it) -> Altium TColor ($00BBGGRR).
+    Altium's stock body is FFFFB0/0000FF."""
+    h = _hex6(h)
+    return (int(h[4:6], 16) << 16) | (int(h[2:4], 16) << 8) | int(h[0:2], 16)
+
+
+_STYLE_PAS = """List1 := TStringList.Create;
+__GETDOC__
+if Obj1 = nil then
+    ResultText := 'ABORT|library not found or not open'
+else if Obj1.ObjectId <> 33 then
+    ResultText := 'ABORT|not a schematic library|' + IntToStr(Obj1.ObjectId)
+else
+begin
+    SandboxLog('library=' + Obj1.DocumentName);
+    Obj5 := nil;
+    Obj4 := Obj1.SchLibIterator_Create;
+    try
+        Obj3 := Obj4.FirstSchObject;
+        while (Obj3 <> nil) and (Obj5 = nil) do
+        begin
+            if Obj3.ObjectId = eSchComponent then
+                if Obj3.LibReference = __NAME__ then Obj5 := Obj3;
+            Obj3 := Obj4.NextSchObject;
+        end;
+    finally
+        Obj1.SchIterator_Destroy(Obj4);
+    end;
+    if Obj5 = nil then
+        ResultText := 'ABORT|symbol not found|' + __NAME__
+    else
+    begin
+        I1 := 0; I2 := 0; I3 := 0; B1 := 0;
+        if __APPLY__ = 1 then SchServer.ProcessControl.PreProcess(Obj1, '');
+        Obj2 := Obj5.SchIterator_Create;
+        try
+            Obj3 := Obj2.FirstSchObject;
+            while Obj3 <> nil do
+            begin
+                if (Obj3.ObjectId = eRectangle) or (Obj3.ObjectId = ePolygon) or (Obj3.ObjectId = eEllipse) then
+                begin
+                    I1 := I1 + 1;
+                    if __APPLY__ = 1 then begin Obj3.Color := __BODY_LINE__; Obj3.AreaColor := __BODY_FILL__; Obj3.LineWidth := __WIDTH__; end;
+                end
+                else if (Obj3.ObjectId = eLine) or (Obj3.ObjectId = ePolyline) or (Obj3.ObjectId = eArc) then
+                begin
+                    I1 := I1 + 1;
+                    if __APPLY__ = 1 then begin Obj3.Color := __DIVIDER__; Obj3.LineWidth := __WIDTH__; end;
+                end
+                else if Obj3.ObjectId = ePin then
+                begin
+                    I2 := I2 + 1;
+                    if __APPLY__ = 1 then Obj3.Color := __PIN__;
+                end
+                else if Obj3.ObjectId = eLabel then
+                begin
+                    I3 := I3 + 1;
+                    if __APPLY__ = 1 then Obj3.Color := __LABEL__;
+                end;
+                Obj3 := Obj2.NextSchObject;
+            end;
+        finally
+            Obj5.SchIterator_Destroy(Obj2);
+        end;
+        if __APPLY__ = 1 then
+        begin
+            SchServer.ProcessControl.PostProcess(Obj1, '');
+            Obj1.GraphicallyInvalidate;
+        end;
+        ResultText := 'OK|' + IntToStr(I1) + '|' + IntToStr(I2) + '|' + IntToStr(I3);
+    end;
+end;"""
+
+
+@_tool()
+async def apply_symbol_style(ctx: Context, symbol_name: str, library_path: str = None,
+                             body_fill: Union[str, int] = "FFFFB0",
+                             body_line: Union[str, int] = "0000FF",
+                             divider_color: Union[str, int] = "",
+                             pin_color: Union[str, int] = "000000",
+                             label_color: Union[str, int] = "0000FF",
+                             line_width: int = 1, apply: bool = False,
+                             timeout_seconds: int = 180) -> str:
+    """
+    Restyle one library symbol in place: body fill/outline colour, divider
+    (line/polyline/arc) colour, line width, pin colour, label colour.
+
+    The house library measured here uses a DIFFERENT red for dividers and
+    labels (980000) than for the body outline (800000), so dividers are
+    their own colour; leave divider_color empty to reuse body_line.
+
+    create_schematic_symbol hard-codes Altium's stock palette (yellow body,
+    blue outline), so generated symbols never matched a house library. This
+    applies a palette AFTER creation - to generated symbols or existing ones -
+    without touching geometry, as one undo step.
+
+    Colours are RRGGBB hex (as a designer reads them); they are converted to
+    Altium's $00BBGGRR TColor internally. The defaults are Altium's stock
+    palette, so calling with no colours is a no-op restyle.
+
+    DEFAULTS TO A PREVIEW (apply=False): counts what would be recoloured.
+
+    Args:
+        symbol_name (str): the symbol's LibReference.
+        library_path (str): the .SchLib holding it; must already be open.
+            Defaults to the focused library. Never a schematic sheet.
+        body_fill, body_line, divider_color, pin_color, label_color (str):
+            RRGGBB hex. Typed str|int only because the MCP layer turns an
+            all-digit hex string such as "800000" into an integer before the
+            tool sees it; pass hex strings, they are recovered either way.
+        line_width (int): Altium size enum; 1 = small (the house norm).
+        apply (bool): False previews; True writes.
+
+    Returns:
+        str: JSON with counts of body graphics, pins and labels affected.
+    """
+    try:
+        body_fill, body_line = _hex6(body_fill), _hex6(body_line)
+        divider_color = _hex6(divider_color) if divider_color not in ("", None) else body_line
+        pin_color, label_color = _hex6(pin_color), _hex6(label_color)
+        cols = {k: _hex_to_bgr(v) for k, v in (("BODY_FILL", body_fill), ("BODY_LINE", body_line),
+                                                ("DIVIDER", divider_color),
+                                                ("PIN", pin_color), ("LABEL", label_color))}
+    except ValueError as e:
+        return json.dumps({"success": False, "error": str(e)})
+    lib = _canon(library_path) if library_path else None
+    getdoc = (f"Obj1 := SchServer.GetSchDocumentByPath({_pas_str(lib)});" if lib
+              else "Obj1 := SchServer.GetCurrentSchDocument;")
+    script = _STYLE_PAS.replace("__GETDOC__", getdoc).replace("__NAME__", _pas_str(symbol_name))
+    for k, v in cols.items():
+        script = script.replace(f"__{k}__", str(v))
+    script = script.replace("__WIDTH__", str(int(line_width))).replace("__APPLY__", "1" if apply else "0")
+    logger.info(f"apply_symbol_style: {symbol_name} in {lib or 'focused library'} apply={apply}")
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    res = (payload.get("result") or "").strip()
+    if res.startswith("ABORT"):
+        return json.dumps({"success": False, "error": res}, indent=2)
+    f = res.split("|")
+    return json.dumps({"success": True, "applied": apply, "symbol": symbol_name,
+                       "library": lib or "focused",
+                       "body_graphics": int(f[1]), "pins": int(f[2]), "labels": int(f[3]),
+                       "style": {"body_fill": body_fill, "body_line": body_line,
+                                 "divider_color": divider_color,
+                                 "pin_color": pin_color, "label_color": label_color,
+                                 "line_width": line_width},
+                       "note": None if apply else "preview only - call again with apply=true",
+                       "undo": "one Ctrl+Z reverts this call" if apply else None}, indent=2)
+
 
 if __name__ == "__main__":
     logger.info("Starting Altium MCP Server...")

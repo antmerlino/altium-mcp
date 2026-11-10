@@ -1246,6 +1246,7 @@ begin
                                     PinObj := Prim;
                                     AddJSONProperty(PrimProps, 'type', 'pin');
                                     AddJSONProperty(PrimProps, 'pin_number', PinObj.Designator);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                     AddJSONProperty(PrimProps, 'pin_name', PinObj.Name);
                                     AddJSONInteger(PrimProps, 'electrical', PinObj.Electrical);
                                     AddJSONInteger(PrimProps, 'orientation', PinObj.Orientation);
@@ -1270,7 +1271,9 @@ begin
                                     AddJSONNumber(PrimProps, 'x2', CoordToMils(Prim.Corner.X));
                                     AddJSONNumber(PrimProps, 'y2', CoordToMils(Prim.Corner.Y));
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                     AddJSONBoolean(PrimProps, 'is_solid', Prim.IsSolid);
+                                    AddJSONInteger(PrimProps, 'area_color', Prim.AreaColor);
                                 end;
                                 eLine:
                                 begin
@@ -1280,18 +1283,22 @@ begin
                                     AddJSONNumber(PrimProps, 'x2', CoordToMils(Prim.Corner.X));
                                     AddJSONNumber(PrimProps, 'y2', CoordToMils(Prim.Corner.Y));
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                 end;
                                 ePolyline:
                                 begin
                                     AddJSONProperty(PrimProps, 'type', 'polyline');
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                     AddVerticesProperty(PrimProps, Prim);
                                 end;
                                 ePolygon:
                                 begin
                                     AddJSONProperty(PrimProps, 'type', 'polygon');
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                     AddJSONBoolean(PrimProps, 'is_solid', Prim.IsSolid);
+                                    AddJSONInteger(PrimProps, 'area_color', Prim.AreaColor);
                                     AddVerticesProperty(PrimProps, Prim);
                                 end;
                                 eArc:
@@ -1303,6 +1310,7 @@ begin
                                     AddJSONNumber(PrimProps, 'start_angle', Prim.StartAngle);
                                     AddJSONNumber(PrimProps, 'end_angle', Prim.EndAngle);
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                 end;
                                 eEllipticalArc:
                                 begin
@@ -1314,6 +1322,7 @@ begin
                                     AddJSONNumber(PrimProps, 'start_angle', Prim.StartAngle);
                                     AddJSONNumber(PrimProps, 'end_angle', Prim.EndAngle);
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                 end;
                                 eEllipse:
                                 begin
@@ -1323,12 +1332,15 @@ begin
                                     AddJSONNumber(PrimProps, 'radius', CoordToMils(Prim.Radius));
                                     AddJSONNumber(PrimProps, 'secondary_radius', CoordToMils(Prim.SecondaryRadius));
                                     AddJSONBoolean(PrimProps, 'is_solid', Prim.IsSolid);
+                                    AddJSONInteger(PrimProps, 'area_color', Prim.AreaColor);
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                 end;
                                 eBezier:
                                 begin
                                     AddJSONProperty(PrimProps, 'type', 'bezier');
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                     AddVerticesProperty(PrimProps, Prim);
                                 end;
                                 ePie:
@@ -1340,7 +1352,9 @@ begin
                                     AddJSONNumber(PrimProps, 'start_angle', Prim.StartAngle);
                                     AddJSONNumber(PrimProps, 'end_angle', Prim.EndAngle);
                                     AddJSONBoolean(PrimProps, 'is_solid', Prim.IsSolid);
+                                    AddJSONInteger(PrimProps, 'area_color', Prim.AreaColor);
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                 end;
                                 eRoundRectangle:
                                 begin
@@ -1352,12 +1366,16 @@ begin
                                     AddJSONNumber(PrimProps, 'corner_x_radius', CoordToMils(Prim.CornerXRadius));
                                     AddJSONNumber(PrimProps, 'corner_y_radius', CoordToMils(Prim.CornerYRadius));
                                     AddJSONInteger(PrimProps, 'line_width', Prim.LineWidth);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
                                     AddJSONBoolean(PrimProps, 'is_solid', Prim.IsSolid);
+                                    AddJSONInteger(PrimProps, 'area_color', Prim.AreaColor);
                                 end;
                                 eLabel:
                                 begin
                                     AddJSONProperty(PrimProps, 'type', 'label');
                                     AddJSONProperty(PrimProps, 'text', Prim.Text);
+                                    AddJSONInteger(PrimProps, 'color', Prim.Color);
+                                    AddJSONInteger(PrimProps, 'font_id', Prim.FontID);
                                     AddJSONNumber(PrimProps, 'x', CoordToMils(Prim.Location.X));
                                     AddJSONNumber(PrimProps, 'y', CoordToMils(Prim.Location.Y));
                                 end;
