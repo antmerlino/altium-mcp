@@ -231,6 +231,61 @@ edge and the designator one line (100 mil) above it.
 with coordinates, plus suggested label positions and a text arrangement
 that collides with nothing. Run it after every drawing pass.
 
+## 17. A cluster is more than its wires and labels
+
+Measured on the finished X2 Control Board and the X9 Main Board MCU comms
+sheets (Verge Aero house style). Re-routing a cluster and stopping at wires
+plus net labels leaves the rest on the wrong net without any warning. Each
+interface cluster on an MCU sheet carries ALL of this:
+
+| Object | Where | Detail |
+|---|---|---|
+| wire per pin | pin's electrical point to a fixed column (left 3700 mil, right 12000 mil) | one row per pin, 100 mil pitch |
+| net label | on the wire, 200 mil from the far end (left x=3900, right x=10200) | `MC_<pin>_<signal>[__<function>]` |
+| **net-class directive** | ON the wire at the pin's electrical point (left x=6900, right x=9500) | parameter set named `MC_<interface>`, hidden `ClassName=<pcb class>`, orientation 1, colour 255. Class is per interface (`MC_UART7`, `MC_SPI5`); ETH uses `ETH0` plus `ETH0_MD` on MDIO/MDC; TIM5 pins use `MC_PWM1` |
+| **test pad** | `TESTPOINT_PAD_MFG` with its pin end on the wire: left x=6400, right x=9700 | plus an `MFG_TP` directive (colour 16711680, `ClassName=MFG_TP`) 100 mil inboard of the pad (left 6300, right 9600) |
+| **differential pair directive** | on each wire of the pair, 500 mil inboard of the pin (x=6400 on the left) | `DIFFPAIR_USB`: `DifferentialPair=True`, `DifferentialPairClassName=USB`, orientation 0 |
+| **harness connector** | its entries sit exactly on the wire ends: left clusters have the connector's RIGHT edge at x=3700 (entries `Side` 1), right clusters have the LEFT edge at x=12000 (entries `Side` 0). Location is the top-left corner, one row above the first entry; entry rows are `top - DistanceFromTop`; XSize 300-600 by name length; YSize = (entries + 1) x 100 | `HarnessType` = a type from the project's `<sheet>.Harness` file (`UART=TX,RX`, `UART_FC=TX,RX,RTS,CTS`, `SPI=SCK,MOSI,MISO`, `I2C`, `SMBUS`, `SDMMC=D3..CK`, `USB=DM,DP`, `CANTXRX`, `SWD`, `ETH_RMII`, `PWMx4`); colours 13213327 / 16511725, entries 7354880 / 8454143, line width 1. Entry names are the harness signal names, in pin order top to bottom |
+| **signal harness** | a 3-vertex line (width 2, colour 15187117) from the connector's primary connection (opposite edge, `top - PrimaryConnectionPosition`, normally the cluster's middle row) to the port's near end | the type label (`SPI`, `UART_FC`) rides on it and is a child of the connector |
+| **harness port** | at the harness end: left x=1800 (harness meets `Location.X + Width`); right ports right-aligned to x=14000 (`Location.X = 14000 - Width`, harness meets `Location.X`) | Name = harness (`UART7`, `SPI6`), same `HarnessType` as the connector. Height 100 mil, colours 128 / 8454143 / 128, font 1. Port names match sheet entries on the parent sheet |
+
+So a cluster that moves one row moves **seven kinds of object** (wire,
+label, class directive, pad + MFG_TP mark, harness connector, signal harness,
+port), and a new cluster needs all of them, not just wires.
+`move_schematic_objects`, `set_parameter_sets`, `set_schematic_ports` and
+`set_harness_connectors` exist for exactly this; the `paramset`, `harness`
+and `signalharness` kinds of `get_schematic_objects` show what is there.
+**Look at `render_schematic` before declaring a sheet done** - the harness
+family was invisible to every geometric check here until the picture showed
+it. A blanket (dashed rectangle) with a directive on its border applies that
+directive to every net inside it; moving wires under a blanket changes what
+it marks. Before
+re-routing, dump `paramset`, `port`, `component` and `pin` and record which
+directive and pad sits on which pin row - after the wires move that
+association is gone from the sheet and only the old dump has it.
+
+Single-signal lines (one timer channel, an ADC input) get no harness: the
+parent sheet exposes them as PLAIN ports named `<PIN>_<SIGNAL>`
+(`PC6_TIM3_CH1`, `PA0_ADC1_INP16`), so the comms sheet carries a plain port
+of that name at the wire end (right side: `Location.X` = 12000, the wire
+end; width ~80 mil per character). A four-channel timer is a `PWMx4`
+harness with a `MC_PWMn` class. Probe pads (`TESTPOINT_PAD`, 100-mil pin)
+do not fit on 100-mil rows, so the house puts them in the free band above a
+cluster with a vertical drop per signal, leftmost pad on the top row so
+drops never cross; MFG pads (50-mil pin) sit directly on the wire. Notes
+(`eNote` text frames) name buses too - retitle them when a bus is renamed
+and grow the frame when a bus is added.
+
+Which bus is which is in the OTHER sheets, not in your head: the FC comms
+sheet's labels named the MC<->FC link, the parent's ports named the plain
+single-signal ports, and neither had to be guessed.
+
+Things that stay the user's: which PCB class a NEW interface gets (a name is
+a routing rule), a harness type that is not in the `.Harness` file yet
+(`QSPI` was placed and flagged), the parent sheet's sheet entries, and
+test pads whose original net no longer exists on the sheet - those get a
+proposal backed by a sibling sheet, stated as such.
+
 ## DelphiScript hazards that bit repeatedly
 
 - **Shared scratch variables.** The sandbox convention (`I1..I5`, `S1..S5`) is

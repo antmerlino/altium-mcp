@@ -175,6 +175,34 @@ The server provides several tools to interact with Altium Designer:
 - `get_library_symbol_reference`: Create symbol's helper tool to use an open library symbol as an example to create the symbol
 - `search_library_symbol`: Search for a symbol by name in a schematic library (.SchLib) and navigate to it. Supports partial name matching. Will open the library file in Altium if a path is provided, or show a file picker if not.
 
+### Schematic sheet editing (an existing, open sheet)
+Every writer below defaults to a **preview** (`apply=False`), refuses anything but a schematic sheet (ObjectId 32; 33 is a library), and applies as **one undo step**. Coordinates are internal units (1 mil = 10000).
+- `get_schematic_objects`: Dump net labels, power ports, ports (with harness type / size / IO type), components, pins (with the ELECTRICAL point, which is not `Pin.Location`), wires, junctions, no-ERC marks and `paramset` directives (net-class / differential-pair / MFG_TP marks with their hidden parameters). Works on un-annotated sheets.
+- `check_net_labels`: Which net labels actually sit ON a wire and name a net, which float, and which names are carried by several labels.
+- `set_net_labels`: Rename / add / delete net labels; the preview reports merges (a rename onto an existing name joins two nets) and labels that would land off every wire.
+- `draw_schematic_wires`: Wires and junctions; the preview reports which ends land on a pin's electrical point.
+- `delete_schematic_objects`: Remove by kind, exact text or bounding area, with a safety cap.
+- `move_schematic_objects`: Move directives, ports, components (pins follow), net labels or power ports, by delta or to a point. The preview flags a directive or a component pin that would end on no wire. **A re-routed cluster leaves its net-class directives, MFG_TP marks and test pads on the neighbour's wire** - this is how you carry them along.
+- `set_parameter_sets`: Create / rename / delete directives - a parameter set whose visible Name is the label and whose hidden parameters carry the meaning (`ClassName=<pcb net class>`, or `DifferentialPair=True` + `DifferentialPairClassName=<pair>`). Placed ON a wire it marks that net.
+- `set_schematic_ports`: Create / edit / delete ports, including harness ports (Name = harness, `HarnessType` from the project's `.Harness` file).
+- `set_harness_connectors`: Add, move or delete harness ASSEMBLIES - a harness connector (with its entries) plus the signal harness to its port. New ones are made by replicating an existing assembly of the same type and side, moving it and editing entries / type / size; the preview reports which entries would miss a wire end. Read them with `get_schematic_objects(kinds=["harness","signalharness"])`.
+- `copy_schematic_area` / `move_schematic_area`: Cluster-level operations. Everything inside a rectangle (wires, labels, class marks, pads and their marks, harness connector, signal harness, port) is copied with renames applied to every text field, or shifted by a delta, in one call - so a new cluster "looks like that one" and a moved cluster leaves nothing behind. Wires that cross the rectangle boundary are skipped and listed.
+- `copy_component`: Another instance of a component already on the sheet (a test pad, a pull-up) by replicating it; the preview says whether the copy's pins land on wires. The library placement route is still broken; this one is verified.
+- `check_hierarchy_live`: Compare every sheet symbol on a parent sheet with the PORTS of the child sheet it stands for - entries with no port, ports with no entry, and name matches whose harness types disagree. Read-only, and it reads children straight from memory when the project has been compiled. Unlike upstream's `check_hierarchy`, it sees unsaved edits.
+- `set_sheet_entries`: Add, edit and remove sheet entries on one sheet symbol (name, side, distance from top, IO type, harness type) - the parent-side counterpart of a child sheet's ports.
+- `check_schematic_structure`: Compile the project and report single-pin nets, unannotated and duplicate designators and pinless parts from Altium's own netlist (the local branch's `check_schematic`, renamed next to upstream's drafting `check_schematic`).
+- `check_sheet_conventions`: Lint against the house cluster anatomy (server/sheetlint.py): unwired pins, unnamed nets, floating labels and directives, interface nets without a class mark, MFG pads without their mark, harness entries off wires, dangling harnesses, ports off their harness, harness types and entry names not in the project's .Harness files, blanket coverage, duplicate ports, unannotated designators. Errors / warnings / infos per finding, with coordinates. Runs live or on a saved dump.
+- `check_erc`: Altium's OWN Electrical Rules Check for the project owning a sheet - the ERC report is generated (WorkspaceManager:GenerateReport, Validation / Electrical Rules Check), its mandatory setup form is confirmed by the tool, and the report's Class / Document / Message rows come back, filterable per sheet. This is the real ERC feedback loop; the messages panel itself cannot be read.
+- Undo stays with the person at the keyboard: every applied tool call is one Ctrl+Z step. `Sch:Undo` run from a script does nothing (measured), so there is no undo tool.
+- `get_project_facts`: Offline (no Altium): project options, documents, harness types with their signals from every .Harness file, per-sheet counts of unannotated designators.
+- `save_documents`: The only thing here that writes to disk; previews what is dirty first.
+- `render_schematic`: A real picture of the CURRENT sheet content (via the clipboard metafile) - the only check that catches overlapping text and mis-drawn objects. `area=[x0,y0,x1,y1]` renders one cluster at a legible scale.
+
+Every sheet tool takes `document=<full path>` (open, not necessarily focused) - pass it. Writers refuse edits that are always wrong (a label, directive or pin landing on no wire) unless `force=true`, and re-read the sheet after applying to confirm what they created exists.
+
+`run_altium_script` runs on upstream's sandbox (pre-run checks, loop guard, undo-group closing). Its template also carries the Verge helpers for sheet scripts: `SandboxEmit()` (a data line logged with an `EMIT: ` prefix and returned to the schematic tools as `emitted`), `SbDoc`, `SbFind`, `SbCount`, `SbMove`, `SbBeginModify`/`SbEndModify`, `SbRegister`, `SbRemove`, `SbReplicateMove`, `SbWire`, `SbNetLabel`, `SbDirective`, `SbPort`, and `Obj10`..`Obj12`. See `server/SandboxScript/Sandbox.pas`.
+
+
 Library paths (`library_path`, `LIBRARY|`, `FPLIB|`) may contain commas and may be spelled in a different case or with forward slashes; `LIBRARY|` and `FPLIB|` paths may also use short (8.3) folder names. An open library is matched to its path after normalizing case and separators, so the tools never open a second copy of it.
 
 ![Symbol Creator](assets/symbol_creator.gif)

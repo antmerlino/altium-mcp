@@ -34,7 +34,11 @@ hostile to automation:
   Same channel the runner uses to launch scripts, so it needs no window focus
   and no synthetic keystrokes. It then **verifies** recovery by running a probe
   script and waiting for output - a wedge is defined by scripts silently doing
-  nothing, so anything less is a guess. Ctrl+F3 remains only as a fallback; it
+  nothing, so anything less is a guess. **Measured: this frequently does not
+  clear a paused debugger** - in one session it worked once in three attempts.
+  When it fails a person has to press Ctrl+F3 in Altium with the script editor
+  active; no automated path reaches the debugger, because Windows refuses
+  `SetForegroundWindow` to a background process. Ctrl+F3 remains only as a fallback; it
   reaches the debugger solely when the script editor is the active document,
   which is why it used to fail silently while reporting success.
 - The runner calls this automatically on every wedge and says whether the
@@ -117,8 +121,12 @@ frame.
 Experiments cannot use constants/helpers defined in the production units
 (`REPLACEALL`, `TrimJSON`, `AddJSONProperty`, ...) - those live in
 `server/AltiumScript/*.pas`, which this project does not include. Declare
-what you need in `Sandbox.pas`. An undefined constant compiles fine and then
-kills the script at runtime.
+what you need in `Sandbox.pas`. An undefined identifier is usually a COMPILE
+error - Altium shows "Undeclared identifier: X" and the script never runs, so
+nothing is half-applied. A member that does not exist on an interface is the
+dangerous case: that survives compilation and kills the script mid-run, with
+everything before it already applied. See
+[`ALTIUM_SCRIPT_API.md`](ALTIUM_SCRIPT_API.md).
 
 ## sandbox_runner.py
 
@@ -134,7 +142,10 @@ python dev/sandbox_runner.py my_experiment.pas [timeout] [--auto-restart]
 - `SandboxLog()` flushes to disk after **every** call, so if the script dies
   silently the last logged step identifies the statement that killed it
 - Detects and closes both dialog classes Altium uses (`#32770` task dialogs
-  and Delphi `TMessageForm`), reporting their text when readable
+  and Delphi `TMessageForm`), reporting their text when readable. Note that
+  `TMessageForm` **paints** its message rather than hosting it in a control,
+  so UI Automation returns only `XPPanels.TXPExtPanel` and `OK` - for those a
+  screenshot is the only way to read the error
 - `--auto-restart`: on a wedge, force-restarts Altium (kills X2.EXE - unsaved
   Altium work is lost), waits for readiness, and retries the experiment once
 
@@ -154,6 +165,12 @@ so a wedge there still leaves everything useful already on disk.
 
 ## Findings
 
+- [`ALTIUM_SCRIPT_API.md`](ALTIUM_SCRIPT_API.md) - **read before writing any
+  DelphiScript.** Verified object IDs and constants, the members that do NOT
+  exist, and why an uncertain identifier belongs in a throwaway probe script
+  rather than in the script that modifies a document.
+- [`SCHEMATIC_PLACEMENT_FINDINGS.md`](SCHEMATIC_PLACEMENT_FINDINGS.md) - placing symbols on a
+  sheet by script: what does not draw, and the copy-a-placed-instance recipe that does.
 - [`SCHEMATIC_CONVENTIONS.md`](SCHEMATIC_CONVENTIONS.md) - **read before
   generating any schematic.** Pin connection points, tap gaps, ground length,
   rail placement, net-label attachment, parameter text, mirroring, and the

@@ -17,6 +17,11 @@ wheels/
 # Virtual environments
 .venv
 
+# golden Altium dumps for the pinout tests are data, not build output
+!pinout/tests/fixtures/*.json
+!pinout/house_style.json
+!pinout/boards/*.json
+
 # Local files holding one company's database data, designs or requests (kept on disk, not published)
 dev/DBLIB_FINDINGS.md
 dev/make_circuit.py
