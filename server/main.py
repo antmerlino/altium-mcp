@@ -6781,12 +6781,337 @@ async def _run_sandbox(script: str, timeout_seconds: int = 120):
             pass
     return payload, images
 
+EXECUTOR_LOCK_FILE = EXCHANGE_DIR / "executor.lock"
+
+
+_EXECUTOR_ASYNC_LOCK = asyncio.Lock()
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """True if a process with this PID currently exists.
+
+    os.kill(pid, 0) is the POSIX idiom for this and must NOT be used here:
+    on Windows os.kill TerminateProcess()es the target for any signal other
+    than CTRL_C_EVENT/CTRL_BREAK_EVENT, so the "harmless" probe would kill
+    the other session's server.
+    """
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return code.value == STILL_ACTIVE
+        return True  # exists but unreadable - assume alive
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _running_altium_paths():
+    """Executable paths of every running X2.EXE, lower-cased."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-Process -Name X2 -ErrorAction SilentlyContinue | "
+             "Select-Object -ExpandProperty Path"],
+            capture_output=True, text=True, timeout=20)
+        return [l.strip().lower() for l in (r.stdout or "").splitlines() if l.strip()]
+    except Exception as e:
+        logger.warning(f"could not list running Altium processes: {e}")
+        return None
+
+
+def _require_running_altium(exe_path):
+    """None if the configured Altium is running; else an error string.
+
+    `X2.EXE -RScriptingSystem:RunScript(...)` LAUNCHES Altium when it is not
+    already running. That is never what a tool call means, and it is how a
+    script dispatch started a half-uninstalled Altium and crashed it. The
+    check also catches a different Altium than the configured one running -
+    the script would go to the wrong product.
+    """
+    running = _running_altium_paths()
+    if running is None:
+        return None  # could not tell; do not block on a broken probe
+    want = str(exe_path).lower()
+    if not running:
+        return ("Altium is not running. Start it (the configured one is %s) and "
+                "retry - this server will not launch Altium itself." % exe_path)
+    if want not in running:
+        return ("A different Altium is running than the one configured: running %s, "
+                "configured %s. Fix altium_exe_path in config.json or start the "
+                "configured one." % (running, exe_path))
+    return None
+
+
+def _capture_hwnd_png(hwnd):
+    """Base64 PNG of a window, rendered with PrintWindow.
+
+    PrintWindow asks the window to paint itself into a DC, so it works even
+    when the window is obscured or the session is disconnected - unlike
+    BitBlt screen-scraping, which returns blanks there.
+    """
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        w, h = right - left, bottom - top
+        if w <= 0 or h <= 0:
+            return None
+        hwndDC = win32gui.GetWindowDC(hwnd)
+        mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+        saveDC = mfcDC.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(mfcDC, w, h)
+        saveDC.SelectObject(bmp)
+        ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)  # PW_RENDERFULLCONTENT
+        info = bmp.GetInfo()
+        img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]),
+                               bmp.GetBitmapBits(True), "raw", "BGRX", 0, 1)
+        win32gui.DeleteObject(bmp.GetHandle())
+        saveDC.DeleteDC()
+        mfcDC.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwndDC)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        logger.warning(f"could not capture dialog window: {e}")
+        return None
+
+
+def _split_dialog_images(dialogs):
+    """Separate JSON-safe dialog records from their PNG attachments."""
+    records, images = [], []
+    for d in dialogs:
+        png = d.pop("_png", None)
+        if png:
+            d = {**d, "image_attached": True}
+            images.append(png)
+        records.append(d)
+    return records, images
+
+
 def _sandbox_return(payload, images):
     """Return JSON alone, or JSON plus the dialog screenshots as image content."""
     text = json.dumps(payload, indent=2)
     if not images:
         return text
     return [text] + [MCPImage(data=base64.b64decode(p), format="png") for p in images]
+
+
+def _read_dialog_text(hwnd):
+    """Read a modal dialog's message text via UI Automation.
+
+    This is the ONLY place a compile/runtime error message exists: Altium
+    reports "Undeclared identifier: eSchDoc" or "EVariantTypeCastError: ..."
+    in a modal box and nowhere else - not in the log, not in a return code.
+    Delphi dialogs are custom-drawn, so EnumChildWindows yields class names
+    rather than the message; UI Automation is what actually reaches the text.
+    Same approach as dev/sandbox_runner.py.
+    """
+    try:
+        ps = (
+            "Add-Type -AssemblyName UIAutomationClient;"
+            "Add-Type -AssemblyName UIAutomationTypes;"
+            f"$el=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{hwnd});"
+            "$all=$el.FindAll([System.Windows.Automation.TreeScope]::Descendants,"
+            "[System.Windows.Automation.Condition]::TrueCondition);"
+            "foreach($e in $all){if($e.Current.Name){Write-Output $e.Current.Name}}"
+        )
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=15)
+        # Button captions are not the message. Leaving them in made a Yes/No
+        # confirmation look "readable", which suppressed the screenshot and
+        # left no record of what was actually being asked.
+        buttons = {"ok", "cancel", "yes", "no", "abort", "retry", "ignore",
+                   "close", "help"}
+        texts = [l.strip() for l in r.stdout.splitlines()
+                 if l.strip() and l.strip().lower() not in buttons
+                 and not l.strip().startswith(("XPPanels.", "TXP", "Panel"))]
+        return " | ".join(texts[:6])
+    except Exception as e:
+        return f"(could not read: {e})"
+
+
+def _competing_platform():
+    """CircuitStudio (DXP.EXE) running alongside Altium Designer takes the
+    RunScript dispatch, and the script dies there with 'Undeclared identifier:
+    GetCurrentSchDocument'. Measured 2026-09-19. Returns a message or None."""
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq DXP.EXE", "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    if "DXP.EXE" in out.upper():
+        return ("CircuitStudio (DXP.EXE) is running and would receive the script dispatch "
+                "instead of Altium Designer. Close it, or stop its script with "
+                "\"C:\\Program Files (x86)\\Altium\\CS\\DXP.EXE\" -REditScript:Stop and close it.")
+    return None
+
+
+# ObjectId values, verified on AD21 - see dev/ALTIUM_SCRIPT_API.md.
+SCH_DOC_OBJECTID = 32          # 33 is a schematic LIBRARY; never edit that here
+
+
+_SCH_KIND_EMITTERS = {
+    "netlabel": ("eNetLabel",
+                 "'netlabel|' + Obj3.Text + '|' + IntToStr(Obj3.Location.X) + '|' "
+                 "+ IntToStr(Obj3.Location.Y) + '|' + IntToStr(Obj3.Orientation)"),
+    "power": ("ePowerObject",
+              "'power|' + Obj3.Text + '|' + IntToStr(Obj3.Location.X) + '|' "
+              "+ IntToStr(Obj3.Location.Y) + '|' + IntToStr(Obj3.Style)"),
+    "port": ("ePort",
+             "'port|' + Obj3.Name + '|' + IntToStr(Obj3.Location.X) + '|' "
+             "+ IntToStr(Obj3.Location.Y) + '|' + Obj3.HarnessType + '|' "
+             "+ IntToStr(Obj3.Width) + '|' + IntToStr(Obj3.Height) + '|' "
+             "+ IntToStr(Obj3.IOType) + '|' + IntToStr(Obj3.Style) + '|' "
+             "+ IntToStr(Obj3.Alignment)"),
+    "component": ("eSchComponent",
+                  "'component|' + Obj3.Designator.Text + '|' + Obj3.LibReference + '|' "
+                  "+ IntToStr(Obj3.Location.X) + '|' + IntToStr(Obj3.Location.Y) + '|' "
+                  "+ IntToStr(Obj3.CurrentPartID) + '|' + IntToStr(Obj3.PartCount)"),
+    "junction": ("eJunction",
+                 "'junction|' + IntToStr(Obj3.Location.X) + '|' + IntToStr(Obj3.Location.Y)"),
+    "noerc": ("eNoERC",
+              "'noerc|' + IntToStr(Obj3.Location.X) + '|' + IntToStr(Obj3.Location.Y)"),
+}
+
+
+_SCH_KINDS = list(_SCH_KIND_EMITTERS) + ["pin", "wire", "paramset", "harness", "signalharness",
+                                          "blanket", "sheetsymbol"]
+
+
+_PIN_BRANCH = """        if I3 = ePin then
+        begin
+            S1 := '?';
+            S2 := '?';
+            if Obj3.Container <> nil then
+                if Obj3.Container.ObjectId = eSchComponent then
+                begin
+                    S1 := Obj3.Container.LibReference;
+                    S2 := Obj3.Container.Designator.Text;
+                end;
+            List1.Add('pin|' + Obj3.Designator + '|' + Obj3.Name + '|' +
+                      IntToStr(Obj3.Location.X) + '|' + IntToStr(Obj3.Location.Y) +
+                      '|' + IntToStr(Obj3.OwnerPartId) + '|' +
+                      IntToStr(Obj3.Orientation) + '|' + IntToStr(Obj3.PinLength) +
+                      '|' + S1 + '|' + S2);
+        end;"""
+
+
+_WIRE_BRANCH = """        if I3 = eWire then
+        begin
+            S3 := 'wire';
+            for I2 := 1 to Obj3.VerticesCount do
+                S3 := S3 + '|' + IntToStr(Obj3.Vertex[I2].X) + ',' +
+                          IntToStr(Obj3.Vertex[I2].Y);
+            List1.Add(S3);
+        end;"""
+
+
+# A parameter set (directive) is a CONTAINER: its Name is the visible label and
+# its meaning lives in hidden child parameters - a net class directive carries
+# ClassName=<class>, a differential-pair directive DifferentialPair=True plus
+# DifferentialPairClassName=<pair class>. Measured on the X9 comms sheet.
+_PARAMSET_BRANCH = """        if I3 = eParameterSet then
+        begin
+            S3 := 'paramset|' + Obj3.Name + '|' + IntToStr(Obj3.Location.X) + '|' +
+                  IntToStr(Obj3.Location.Y) + '|' + IntToStr(Obj3.Orientation) + '|' +
+                  IntToStr(Obj3.Color);
+            Obj4 := Obj3.SchIterator_Create;
+            try
+                Obj4.AddFilter_ObjectSet(MkSet(eParameter));
+                Obj5 := Obj4.FirstSchObject;
+                while Obj5 <> nil do
+                begin
+                    S3 := S3 + '|' + Obj5.Name + '=' + Obj5.Text;
+                    if Obj5.IsHidden then S3 := S3 + '=H' else S3 := S3 + '=V';
+                    Obj5 := Obj4.NextSchObject;
+                end;
+            finally
+                Obj3.SchIterator_Destroy(Obj4);
+            end;
+            List1.Add(S3);
+        end;"""
+
+
+# Harness objects. A harness connector (ObjectId 53) is a container: Location
+# is its TOP-LEFT corner, entries (54) hang at Location.Y - DistanceFromTop on
+# Side 1 (right edge) or Side 0 (left edge), and the signal harness (56, a
+# polyline) meets it at PrimaryConnectionPosition below the top on the
+# opposite edge. These live in the .SchDoc "Additional" stream, which is why
+# an offline parser that reads only FileHeader sees no harnesses at all.
+_HARNESS_BRANCH = """        if I3 = eHarnessConnector then
+        begin
+            S3 := 'harness|' + Obj3.HarnessType + '|' + IntToStr(Obj3.Location.X) + '|' +
+                  IntToStr(Obj3.Location.Y) + '|' + IntToStr(Obj3.XSize) + '|' +
+                  IntToStr(Obj3.YSize) + '|' + IntToStr(Obj3.PrimaryConnectionPosition);
+            Obj4 := Obj3.SchIterator_Create;
+            try
+                Obj4.AddFilter_ObjectSet(MkSet(eHarnessEntry));
+                Obj5 := Obj4.FirstSchObject;
+                while Obj5 <> nil do
+                begin
+                    S3 := S3 + '|' + Obj5.Name + ',' + IntToStr(Obj5.Location.X) + ',' +
+                          IntToStr(Obj5.Location.Y) + ',' + IntToStr(Obj5.Side) + ',' +
+                          IntToStr(Obj5.DistanceFromTop);
+                    Obj5 := Obj4.NextSchObject;
+                end;
+            finally
+                Obj3.SchIterator_Destroy(Obj4);
+            end;
+            List1.Add(S3);
+        end;"""
+
+
+_SIGNAL_HARNESS_BRANCH = """        if I3 = eSignalHarness then
+        begin
+            S3 := 'signalharness';
+            for I2 := 1 to Obj3.VerticesCount do
+                S3 := S3 + '|' + IntToStr(Obj3.Vertex[I2].X) + ',' +
+                          IntToStr(Obj3.Vertex[I2].Y);
+            List1.Add(S3);
+        end;"""
+
+
+# A sheet symbol (eSheetSymbol = 41) is the parent-sheet stand-in for a child
+# sheet: SheetName.Text is the displayed name, SheetFileName.Text the child
+# document. Its entries (eSheetEntry = 40) are what a child sheet's PORTS must
+# match - name and harness type - or the project compiles with a harness or
+# net-name conflict. `FileName` is undeclared; it is `SheetFileName`.
+_SHEET_SYMBOL_BRANCH = """        if I3 = eSheetSymbol then
+        begin
+            S3 := 'sheetsymbol|' + Obj3.SheetName.Text + '|' + Obj3.SheetFileName.Text + '|' +
+                  IntToStr(Obj3.Location.X) + '|' + IntToStr(Obj3.Location.Y) + '|' +
+                  IntToStr(Obj3.XSize) + '|' + IntToStr(Obj3.YSize);
+            Obj4 := Obj3.SchIterator_Create;
+            try
+                Obj4.AddFilter_ObjectSet(MkSet(eSheetEntry));
+                Obj5 := Obj4.FirstSchObject;
+                while Obj5 <> nil do
+                begin
+                    S3 := S3 + '|' + Obj5.Name + ',' + IntToStr(Obj5.Side) + ',' +
+                          IntToStr(Obj5.DistanceFromTop) + ',' + IntToStr(Obj5.IOType) + ',' +
+                          Obj5.HarnessType;
+                    Obj5 := Obj4.NextSchObject;
+                end;
+            finally
+                Obj3.SchIterator_Destroy(Obj4);
+            end;
+            List1.Add(S3);
+        end;"""
+
+
+# A blanket (eBlanket = 61) is the dashed rectangle whose border directive marks
+# every net inside it. `Corner` is undeclared through the API; BoundingRectangle
+# gives the extent (Left/Bottom/Right/Top).
+_BLANKET_BRANCH = """        if I3 = eBlanket then
+            List1.Add('blanket|' + IntToStr(Obj3.BoundingRectangle.Left) + '|' +
+                      IntToStr(Obj3.BoundingRectangle.Bottom) + '|' +
+                      IntToStr(Obj3.BoundingRectangle.Right) + '|' +
+                      IntToStr(Obj3.BoundingRectangle.Top));"""
 
 
 def _canon(path):
@@ -6806,6 +7131,993 @@ def _canon(path):
 def _pas_str(value) -> str:
     """A DelphiScript string literal - single quotes are doubled to escape."""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _target_document(script, document=None):
+    """Point a generated sheet script at `document` (full path) instead of the
+    focused document.
+
+    GetCurrentSchDocument returns nil whenever the focused document is not a
+    schematic - the user clicked another tab, or a compile focused the
+    sandbox project - and a nil receiver is reported as "Undeclared
+    identifier: DocumentName". GetSchDocumentByPath needs the sheet OPEN, not
+    focused, and never changes what the user is looking at.
+    """
+    if not document:
+        return script
+    path = _canon(document)
+    return script.replace("Obj1 := SchServer.GetCurrentSchDocument;",
+                          "Obj1 := SchServer.GetSchDocumentByPath(%s);" % _pas_str(path), 1)
+
+
+# The project that matters is the one owning the sheet being edited, not
+# whatever Altium happens to have focused. After any run_altium_script the
+# focused project is the sandbox SCRIPT project; compiling that yields no
+# flattened document. Measured 2026-09-19.
+# __DOC__ is the target document's full path ('' = use the focused schematic).
+# Resolution: the project that owns that document; else the focused project
+# unless it is a script project; else the ONLY open .PrjPcb - with several
+# open and no owner match, it refuses rather than guessing (it once compiled
+# an unrelated ESC project because "last .PrjPcb wins").
+_PROJECT_PRELUDE = """Obj1 := nil;
+S3 := '__DOC__';
+if S3 = '' then Obj5 := SchServer.GetCurrentSchDocument
+else Obj5 := SchServer.GetSchDocumentByPath(S3);
+if Obj5 <> nil then S3 := Obj5.DocumentName;
+I2 := 0;
+for I3 := 0 to GetWorkspace.DM_ProjectCount - 1 do
+begin
+    Obj4 := GetWorkspace.DM_Projects(I3);
+    if Pos('.PRJPCB', UpperCase(Obj4.DM_ProjectFullPath)) > 0 then
+    begin
+        I2 := I2 + 1;
+        if Obj3 = nil then Obj3 := Obj4;
+    end;
+    if S3 <> '' then
+        for B1 := 0 to Obj4.DM_LogicalDocumentCount - 1 do
+            if UpperCase(Obj4.DM_LogicalDocuments(B1).DM_FullPath) = UpperCase(S3) then Obj1 := Obj4;
+end;
+if Obj1 = nil then
+begin
+    Obj1 := GetWorkspace.DM_FocusedProject;
+    if Obj1 <> nil then
+        if Pos('.PRJSCR', UpperCase(Obj1.DM_ProjectFullPath)) > 0 then Obj1 := nil;
+end;
+if (Obj1 = nil) and (I2 = 1) then Obj1 := Obj3;
+if (Obj1 = nil) and (I2 > 1) then
+begin
+    S2 := '';
+    for I3 := 0 to GetWorkspace.DM_ProjectCount - 1 do
+        if Pos('.PRJPCB', UpperCase(GetWorkspace.DM_Projects(I3).DM_ProjectFullPath)) > 0 then
+            S2 := S2 + ';' + GetWorkspace.DM_Projects(I3).DM_ProjectFullPath;
+    List1.Add('ERR|several PCB projects are open and none owns the target document - pass document=; candidates' + S2);
+end;"""
+
+
+def _project_script(template, document=None):
+    """Fill the project prelude's target document into a workspace script."""
+    path = _canon(document) if document else ""
+    return template.replace("__DOC__", str(path).replace("'", "''"))
+
+
+def _sch_dump_script(kinds, document=None):
+    """Build a read-only sheet dump emitting one pipe-delimited line per object."""
+    branches = []
+    for kind in kinds:
+        if kind in _SCH_KIND_EMITTERS:
+            const, expr = _SCH_KIND_EMITTERS[kind]
+            branches.append("        if I3 = %s then\n            List1.Add(%s);"
+                            % (const, expr))
+    if "pin" in kinds:
+        branches.append(_PIN_BRANCH)
+    if "wire" in kinds:
+        branches.append(_WIRE_BRANCH)
+    if "paramset" in kinds:
+        branches.append(_PARAMSET_BRANCH)
+    if "harness" in kinds:
+        branches.append(_HARNESS_BRANCH)
+    if "signalharness" in kinds:
+        branches.append(_SIGNAL_HARNESS_BRANCH)
+    if "blanket" in kinds:
+        branches.append(_BLANKET_BRANCH)
+    if "sheetsymbol" in kinds:
+        branches.append(_SHEET_SYMBOL_BRANCH)
+    body = "\n".join(branches) if branches else "        ;"
+    script = """List1 := TStringList.Create;
+Obj1 := SchServer.GetCurrentSchDocument;
+if Obj1 = nil then
+    List1.Add('doc|(none)|0')
+else
+begin
+    List1.Add('doc|' + Obj1.DocumentName + '|' + IntToStr(Obj1.ObjectId));
+    Obj2 := Obj1.SchIterator_Create;
+    try
+        Obj3 := Obj2.FirstSchObject;
+        while Obj3 <> nil do
+        begin
+            I3 := Obj3.ObjectId;
+%s
+            Obj3 := Obj2.NextSchObject;
+        end;
+    finally
+        Obj1.SchIterator_Destroy(Obj2);
+    end;
+end;
+ResultText := List1.Text;""" % body
+    return _target_document(script, document)
+
+
+def _pin_connect_point(x, y, orientation, length):
+    """The ELECTRICAL end of a pin.
+
+    Pin.Location is the body end; the connection point is PinLength further
+    along the pin. Using Location silently misses every connection - see
+    dev/SCHEMATIC_CONVENTIONS.md.
+    """
+    if orientation == 0:
+        return x + length, y
+    if orientation == 1:
+        return x, y + length
+    if orientation == 2:
+        return x - length, y
+    if orientation == 3:
+        return x, y - length
+    return x, y
+
+
+def _parse_sch_dump(result_text):
+    """Turn the pipe-delimited dump into (document, objects)."""
+    doc, objs = {}, []
+    for line in (result_text or "").splitlines():
+        if not line.strip():
+            continue
+        f = line.split("|")
+        kind = f[0]
+        try:
+            if kind == "doc":
+                doc = {"name": f[1], "object_id": int(f[2]),
+                       "is_schematic_sheet": int(f[2]) == SCH_DOC_OBJECTID}
+            elif kind == "netlabel":
+                objs.append({"kind": kind, "text": f[1], "x": int(f[2]),
+                             "y": int(f[3]), "orientation": int(f[4])})
+            elif kind == "power":
+                objs.append({"kind": kind, "text": f[1], "x": int(f[2]),
+                             "y": int(f[3]), "style": int(f[4])})
+            elif kind == "port":
+                rec = {"kind": kind, "name": f[1], "x": int(f[2]), "y": int(f[3])}
+                if len(f) >= 10:
+                    rec.update({"harness_type": f[4], "width": int(f[5]),
+                                "height": int(f[6]), "io_type": int(f[7]),
+                                "style": int(f[8]), "alignment": int(f[9])})
+                objs.append(rec)
+            elif kind == "sheetsymbol":
+                entries = []
+                for e in f[7:]:
+                    if not e:
+                        continue
+                    name, side, dft, io, htype = e.rsplit(",", 4)
+                    entries.append({"name": name, "side": int(side), "distance_from_top": int(dft),
+                                    "io_type": int(io), "harness_type": htype})
+                objs.append({"kind": kind, "name": f[1], "file_name": f[2], "x": int(f[3]), "y": int(f[4]),
+                             "x_size": int(f[5]), "y_size": int(f[6]), "entries": entries})
+            elif kind == "blanket":
+                objs.append({"kind": kind, "x0": int(f[1]), "y0": int(f[2]), "x1": int(f[3]), "y1": int(f[4]),
+                             "x": int(f[1]), "y": int(f[2])})
+            elif kind == "harness":
+                entries = []
+                for e in f[7:]:
+                    if not e:
+                        continue
+                    name, ex, ey, side, dft = e.rsplit(",", 4)
+                    entries.append({"name": name, "x": int(ex), "y": int(ey),
+                                    "side": int(side), "distance_from_top": int(dft)})
+                objs.append({"kind": kind, "harness_type": f[1], "x": int(f[2]), "y": int(f[3]),
+                             "x_size": int(f[4]), "y_size": int(f[5]),
+                             "primary_connection_position": int(f[6]), "entries": entries})
+            elif kind == "signalharness":
+                pts = [tuple(int(v) for v in p.split(",")) for p in f[1:] if p]
+                rec = {"kind": kind, "vertices": [{"x": a, "y": b} for a, b in pts]}
+                if pts:
+                    rec["x"], rec["y"] = pts[0]
+                objs.append(rec)
+            elif kind == "paramset":
+                params = []
+                for p in f[6:]:
+                    if not p:
+                        continue
+                    name, _, rest = p.partition("=")
+                    text, _, vis = rest.rpartition("=")
+                    params.append({"name": name, "text": text, "hidden": vis == "H"})
+                objs.append({"kind": kind, "name": f[1], "x": int(f[2]), "y": int(f[3]),
+                             "orientation": int(f[4]), "color": int(f[5]),
+                             "params": params})
+            elif kind == "component":
+                objs.append({"kind": kind, "designator": f[1], "lib_reference": f[2],
+                             "x": int(f[3]), "y": int(f[4]),
+                             "current_part_id": int(f[5]),
+                             "part_count": int(f[6]) if len(f) > 6 else 1})
+            elif kind == "pin":
+                x, y, ori, ln = int(f[3]), int(f[4]), int(f[6]), int(f[7])
+                cx, cy = _pin_connect_point(x, y, ori, ln)
+                objs.append({"kind": kind, "designator": f[1], "name": f[2],
+                             "x": x, "y": y, "owner_part_id": int(f[5]),
+                             "orientation": ori, "pin_length": ln,
+                             "owner_lib_reference": f[8], "owner_designator": f[9],
+                             "connect_x": cx, "connect_y": cy})
+            elif kind in ("junction", "noerc"):
+                objs.append({"kind": kind, "x": int(f[1]), "y": int(f[2])})
+            elif kind == "wire":
+                pts = [tuple(int(v) for v in p.split(",")) for p in f[1:] if p]
+                rec = {"kind": kind,
+                       "vertices": [{"x": a, "y": b} for a, b in pts]}
+                # Give a wire the same single anchor the DelphiScript side
+                # filters on (ISch_Wire.Location is its first vertex), so an
+                # area filter means the same thing in the preview and in the
+                # script that actually deletes.
+                if pts:
+                    rec["x"], rec["y"] = pts[0]
+                objs.append(rec)
+        except (ValueError, IndexError):
+            objs.append({"kind": "unparsed", "raw": line})
+    return doc, objs
+
+
+def _point_on_segment(p, a, b):
+    """Exact integer point-on-segment test - schematic coords are integers."""
+    (px, py), (ax, ay), (bx, by) = p, a, b
+    if (bx - ax) * (py - ay) - (by - ay) * (px - ax) != 0:
+        return False
+    return min(ax, bx) <= px <= max(ax, bx) and min(ay, by) <= py <= max(ay, by)
+
+
+def _wire_segments(objects):
+    segs = []
+    for o in objects:
+        if o.get("kind") == "wire":
+            v = [(p["x"], p["y"]) for p in o["vertices"]]
+            segs += list(zip(v, v[1:]))
+    return segs
+
+
+_RENDER_PAS = """Obj3 := Client.GetDocumentByPath('__DOC__');
+if (Obj3 = nil) then
+    Obj3 := Client.OpenDocument('SCH', '__DOC__');
+if (Obj3 = nil) then
+begin
+    SandboxLog('cannot open __DOC__');
+    ResultText := 'ERR|cannot open document';
+end
+else
+begin
+    Client.ShowDocument(Obj3);
+    Sleep(1200);
+    SandboxLog('shown');
+__SELECT__
+    ResetParameters;
+    RunProcess('Sch:Copy');
+    ResetParameters;
+    RunProcess('Sch:DeSelect');
+    SandboxLog('copied to clipboard');
+    ResultText := 'OK';
+end;"""
+
+
+_RENDER_SELECT_ALL = """    ResetParameters;
+    AddStringParameter('Action', 'All');
+    RunProcess('Sch:Select');"""
+
+
+# Select only the objects inside a rectangle (every vertex for wires and
+# harnesses, the anchor otherwise), so the copied metafile - and the picture -
+# is one cluster at a legible scale instead of the whole sheet. The iterator
+# is filtered to drawable kinds: unfiltered it yields sheet-level objects
+# without Location ("Undeclared identifier: Location" - measured).
+_RENDER_SELECT_AREA = """    ResetParameters;
+    RunProcess('Sch:DeSelect');
+    Obj1 := SchServer.GetSchDocumentByPath('__DOC__');
+    Obj2 := Obj1.SchIterator_Create;
+    Obj2.AddFilter_ObjectSet(MkSet(eWire, eNetLabel, eParameterSet, ePort, eHarnessConnector, eSignalHarness, eSchComponent, ePowerObject, eNoERC, eJunction, eNote, eLabel, eBlanket, ePolyline, eLine, eRectangle, eBus, eBusEntry));
+    try
+        Obj4 := Obj2.FirstSchObject;
+        while Obj4 <> nil do
+        begin
+            B2 := 1;
+            if (Obj4.ObjectId = eWire) or (Obj4.ObjectId = eSignalHarness) or (Obj4.ObjectId = ePolyline) then
+            begin
+                for I4 := 1 to Obj4.VerticesCount do
+                    if (Obj4.Vertex[I4].X < __X0__) or (Obj4.Vertex[I4].X > __X1__) or (Obj4.Vertex[I4].Y < __Y0__) or (Obj4.Vertex[I4].Y > __Y1__) then B2 := 0;
+            end
+            else if (Obj4.Location.X < __X0__) or (Obj4.Location.X > __X1__) or (Obj4.Location.Y < __Y0__) or (Obj4.Location.Y > __Y1__) then B2 := 0;
+            if B2 = 1 then Obj4.Selection := True;
+            Obj4 := Obj2.NextSchObject;
+        end;
+    finally
+        Obj1.SchIterator_Destroy(Obj2);
+    end;"""
+
+
+def _render_script(doc, area=None):
+    if area:
+        x0, y0, x1, y1 = [int(v) for v in area]
+        sel = (_RENDER_SELECT_AREA.replace("__X0__", str(min(x0, x1))).replace("__X1__", str(max(x0, x1)))
+               .replace("__Y0__", str(min(y0, y1))).replace("__Y1__", str(max(y0, y1))))
+    else:
+        sel = _RENDER_SELECT_ALL
+    return _RENDER_PAS.replace("__SELECT__", sel).replace("__DOC__", str(doc))
+
+
+# Pull the enhanced metafile off the clipboard and rasterise it. Extracted
+# from dev/render_sheet.py, which established that this is the only reliable
+# route: Altium paints a schematic view only once it has actually been
+# displayed, so window capture returns stale or black pixels while every API
+# signal claims the right document is current.
+_RENDER_PS = r"""
+Add-Type -AssemblyName System.Drawing
+$sig = @'
+using System;
+using System.Runtime.InteropServices;
+public class ClipEmf {
+  [DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool CloseClipboard();
+  [DllImport("user32.dll")] public static extern IntPtr GetClipboardData(uint fmt);
+  [DllImport("user32.dll")] public static extern bool IsClipboardFormatAvailable(uint fmt);
+  [DllImport("gdi32.dll")] public static extern IntPtr CopyEnhMetaFile(IntPtr h, string f);
+  [DllImport("gdi32.dll")] public static extern bool DeleteEnhMetaFile(IntPtr h);
+}
+'@
+Add-Type -TypeDefinition $sig
+if (-not [ClipEmf]::IsClipboardFormatAvailable(14)) { Write-Output 'NOEMF'; exit 1 }
+[ClipEmf]::OpenClipboard([IntPtr]::Zero) | Out-Null
+$h = [ClipEmf]::GetClipboardData(14)
+$copy = [ClipEmf]::CopyEnhMetaFile($h, '__EMF__')
+[ClipEmf]::DeleteEnhMetaFile($copy) | Out-Null
+[ClipEmf]::CloseClipboard() | Out-Null
+$img = [System.Drawing.Image]::FromFile('__EMF__')
+$w = __W__; $h2 = [int]($w * $img.Height / $img.Width)
+$bmp = New-Object System.Drawing.Bitmap $w, $h2
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.Clear([System.Drawing.Color]::White)
+$g.SmoothingMode = 'AntiAlias'
+$g.DrawImage($img, 0, 0, $w, $h2)
+$g.Dispose()
+$bmp.Save('__PNG__', [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Dispose(); $img.Dispose()
+Write-Output ('rendered ' + $w + 'x' + $h2)
+"""
+
+
+@_tool(read_only=True)
+async def render_schematic(ctx: Context, document: str = None, width: int = 2400, area: list = None,
+                           timeout_seconds: int = 200):
+    """
+    Render a schematic sheet to an image you can actually look at.
+
+    This is the reliable mechanism. Window capture does NOT work for
+    schematics: Altium paints a view only once it has really been displayed,
+    so a background capture returns the previous document's pixels or black
+    while every API signal insists the right document is current. This route
+    needs no window - Select All + Sch:Copy puts a framed enhanced metafile on
+    the clipboard (the same path that pastes a schematic into Word) and that
+    is rasterised here, so the image always reflects CURRENT content.
+
+    Use it to check work that geometry cannot: text overlap, net labels
+    colliding with wires, parameters sitting on top of each other, and whether
+    a sheet simply looks right.
+
+    SIDE EFFECT: overwrites the Windows clipboard. Avoid running it while the
+    user is mid copy-paste.
+
+    Args:
+        document (str): full path of the sheet. Defaults to the focused one.
+        width (int): output width in pixels (default 2400).
+        area (list): [x0, y0, x1, y1] in internal units - render only the
+            objects inside (wires and harnesses need every vertex inside).
+            The way to look at one cluster at a legible scale.
+        timeout_seconds (int): how long to wait for Altium.
+
+    Returns:
+        The rendered PNG as image content, plus a JSON metadata block.
+    """
+    doc = _canon(document)
+    if not doc:
+        payload, images = await _run_sandbox(_sch_dump_script([]), 120)
+        if not payload.get("success"):
+            return _sandbox_return(payload, images)
+        info, _ = _parse_sch_dump(payload.get("result", ""))
+        doc = info.get("name")
+        if not doc or doc == "(none)":
+            return json.dumps({"success": False,
+                               "error": "no schematic is focused; pass document="})
+    logger.info(f"render_schematic: {doc}")
+
+    payload, images = await _run_sandbox(_render_script(doc, area),
+                                         timeout_seconds)
+    if not payload.get("success") or str(payload.get("result", "")).startswith("ERR"):
+        payload.setdefault("error", "could not copy the sheet to the clipboard")
+        payload["document"] = doc
+        return _sandbox_return(payload, images)
+
+    emf = EXCHANGE_DIR / "render_sheet.emf"
+    png = EXCHANGE_DIR / "render_sheet.png"
+    for f in (emf, png):
+        if f.exists():
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    ps = (_RENDER_PS.replace("__EMF__", str(emf))
+                    .replace("__W__", str(int(width)))
+                    .replace("__PNG__", str(png)))
+    try:
+        r = await asyncio.to_thread(
+            subprocess.run, ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=200)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"rasterise failed: {e}"})
+    if "rendered" not in (r.stdout or "") or not png.exists():
+        return json.dumps({"success": False, "document": doc,
+                           "error": "clipboard held no metafile to rasterise",
+                           "detail": ((r.stdout or "") + (r.stderr or ""))[-400:]})
+
+    data = png.read_bytes()
+    return [json.dumps({"success": True, "document": doc, "width": int(width),
+                        "detail": r.stdout.strip(), "bytes": len(data)}),
+            MCPImage(data=data, format="png")]
+
+
+_NETLIST_PAS = """List1 := TStringList.Create;
+Obj3 := nil;
+""" + _PROJECT_PRELUDE + """
+if Obj1 = nil then
+    List1.Add('ERR|no focused project')
+else
+begin
+    SandboxLog('compiling ' + Obj1.DM_ProjectFullPath);
+    Obj1.DM_Compile;
+    SandboxLog('compiled');
+    List1.Add('project|' + Obj1.DM_ProjectFullPath);
+    Obj2 := Obj1.DM_DocumentFlattened;
+    if Obj2 = nil then
+        List1.Add('ERR|compile produced no flattened document')
+    else
+    begin
+        I1 := Obj2.DM_NetCount;
+        I2 := Obj2.DM_ComponentCount;
+        SandboxLog('nets=' + IntToStr(I1) + ' components=' + IntToStr(I2));
+        List1.Add('counts|' + IntToStr(I1) + '|' + IntToStr(I2));
+__COMPONENTS__
+__NETS__
+    end;
+end;
+ResultText := List1.Text;
+SandboxLog('done');"""
+
+
+_NETLIST_COMPONENTS = """        for B1 := 0 to I2 - 1 do
+        begin
+            Obj3 := Obj2.DM_Components(B1);
+            List1.Add('comp|' + Obj3.DM_PhysicalDesignator + '|' +
+                      Obj3.DM_LogicalDesignator + '|' +
+                      IntToStr(Obj3.DM_PinCount) + '|' +
+                      Obj3.DM_OwnerDocumentName);
+        end;"""
+
+
+_NETLIST_NETS = """        for B1 := 0 to I1 - 1 do
+        begin
+            Obj3 := Obj2.DM_Nets(B1);
+            S1 := 'net|' + Obj3.DM_NetName + '|' + IntToStr(Obj3.DM_PinCount);
+            for I3 := 0 to Obj3.DM_PinCount - 1 do
+            begin
+                Obj4 := Obj3.DM_Pins(I3);
+                S1 := S1 + '|' + Obj4.DM_LogicalPartDesignator + '.' + Obj4.DM_PinNumber;
+            end;
+            List1.Add(S1);
+        end;"""
+
+
+def _parse_netlist(result_text):
+    project, counts, nets, comps, errors = None, {}, [], [], []
+    for line in (result_text or "").splitlines():
+        if not line.strip():
+            continue
+        f = line.split("|")
+        try:
+            if f[0] == "ERR":
+                errors.append(f[1])
+            elif f[0] == "project":
+                project = f[1]
+            elif f[0] == "counts":
+                counts = {"nets": int(f[1]), "components": int(f[2])}
+            elif f[0] == "comp":
+                comps.append({"designator": f[1], "logical_designator": f[2],
+                              "pin_count": int(f[3]), "sheet": f[4],
+                              "annotated": "?" not in f[1]})
+            elif f[0] == "net":
+                pins = [{"designator": p.rsplit(".", 1)[0], "pin": p.rsplit(".", 1)[1]}
+                        for p in f[3:] if "." in p]
+                nets.append({"name": f[1], "pin_count": int(f[2]), "pins": pins})
+        except (ValueError, IndexError):
+            errors.append("unparsed: " + line)
+    return project, counts, nets, comps, errors
+
+
+@_tool(read_only=True)
+async def get_schematic_netlist(ctx: Context, nets: list = None,
+                                designators: list = None, include_components: bool = True,
+                                max_nets: int = 0, document: str = None, sheet: str = None,
+                                timeout_seconds: int = 300) -> str:
+    """
+    Compile the focused project and return its netlist: which pins are on
+    which net, across all sheets.
+
+    This is Altium's OWN netlist, not geometry. It is the difference between
+    editing objects and understanding a circuit, and unlike a geometric walk
+    it is correct for mirrored and multi-part components.
+
+    Compiling is what a person does before any netlist-dependent action; it
+    does not change the drawing, though Altium may mark documents modified.
+
+    Unannotated components (designator still "U?") compile as such and are
+    reported with annotated=false - their nets are usually meaningless until
+    annotate_schematic has run.
+
+    Args:
+        nets (list): only return these net names (case-insensitive).
+        designators (list): only return nets touching these components.
+        include_components (bool): include the component inventory.
+        max_nets (int): cap the nets returned; 0 means no cap.
+        document (str): full path of a sheet in the project to compile. Pass
+            it: the focused project is the sandbox script project after any
+            script run, and with several PCB projects open the tool refuses
+            to guess.
+        sheet (str): only nets touching a component on this sheet (file name
+            or full path, case-insensitive). Implies include_components.
+        timeout_seconds (int): compiling a large project takes a while.
+
+    Returns:
+        str: JSON with project, counts, nets[{name, pin_count, pins[]}] and
+             components[{designator, pin_count, sheet, annotated}].
+    """
+    logger.info("get_schematic_netlist")
+    if sheet:
+        include_components = True
+    script = (_project_script(_NETLIST_PAS, document)
+              .replace("__COMPONENTS__", _NETLIST_COMPONENTS if include_components else "")
+              .replace("__NETS__", _NETLIST_NETS))
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    project, counts, all_nets, comps, errors = _parse_netlist(payload.get("result", ""))
+    if errors and not all_nets:
+        return json.dumps({"success": False, "errors": errors, "project": project},
+                          indent=2)
+
+    sel = all_nets
+    if sheet:
+        key = str(sheet).lower().replace("/", "\\")
+        on_sheet = {c["designator"].upper() for c in comps
+                    if c.get("sheet") and (c["sheet"].lower().endswith(key) or key.endswith(c["sheet"].lower()))}
+        sel = [n for n in sel if any(p["designator"].upper() in on_sheet for p in n["pins"])]
+    if nets:
+        want = set(n.lower() for n in nets)
+        sel = [n for n in sel if n["name"].lower() in want]
+    if designators:
+        want = set(d.upper() for d in designators)
+        sel = [n for n in sel if any(p["designator"].upper() in want for p in n["pins"])]
+    truncated = False
+    if max_nets and len(sel) > max_nets:
+        sel, truncated = sel[:max_nets], True
+
+    out = {"success": True, "project": project, "counts": counts,
+           "nets_returned": len(sel), "truncated": truncated, "nets": sel}
+    if include_components:
+        out["components"] = comps
+    if errors:
+        out["parse_errors"] = errors
+    return json.dumps(out, indent=2)
+
+
+@_tool(read_only=True)
+async def check_schematic_structure(ctx: Context, timeout_seconds: int = 300) -> str:
+    """
+    Compile the focused project and report the structural faults that make a
+    schematic wrong, rather than merely ugly.
+
+    This is the schematic sibling of check_placement: run it after editing and
+    before trusting a sheet. It reports, from Altium's own compiled netlist:
+
+      * single-pin nets - a pin connected to nothing, or a wire that missed
+      * unannotated components - designators still containing "?", which make
+        every net name provisional
+      * duplicate designators - two parts claiming one name
+      * pinless components in the netlist
+
+    It does NOT replace Altium's full ERC rule set; it covers the faults that
+    an automated edit actually causes.
+
+    Returns:
+        str: JSON with counts and the offending items.
+    """
+    logger.info("check_schematic_structure")
+    script = (_NETLIST_PAS
+              .replace("__COMPONENTS__", _NETLIST_COMPONENTS)
+              .replace("__NETS__", _NETLIST_NETS))
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    project, counts, nets, comps, errors = _parse_netlist(payload.get("result", ""))
+
+    single = [{"net": n["name"], "pins": n["pins"]} for n in nets if n["pin_count"] < 2]
+    unannotated = [c for c in comps if not c["annotated"]]
+    seen, dupes = {}, []
+    for c in comps:
+        if c["annotated"]:
+            seen.setdefault(c["designator"], []).append(c["sheet"])
+    for d, sheets in seen.items():
+        if len(sheets) > 1:
+            dupes.append({"designator": d, "sheets": sheets})
+    pinless = [c for c in comps if c["pin_count"] == 0]
+
+    findings = {
+        "single_pin_nets": single,
+        "unannotated_components": unannotated,
+        "duplicate_designators": dupes,
+        "pinless_components": pinless,
+    }
+    summary = dict((k, len(v)) for k, v in findings.items())
+    summary["clean"] = not any(summary.values())
+    return json.dumps({"success": True, "project": project, "counts": counts,
+                       "summary": summary, "findings": findings,
+                       "parse_errors": errors or None}, indent=2)
+
+
+_DOCSTATE_PAS = """List1 := TStringList.Create;
+Obj3 := nil;
+""" + _PROJECT_PRELUDE + """
+if Obj1 = nil then
+    List1.Add('ERR|no focused project')
+else
+begin
+    List1.Add('project|' + Obj1.DM_ProjectFullPath);
+    I1 := Obj1.DM_LogicalDocumentCount;
+    for B1 := 0 to I1 - 1 do
+    begin
+        Obj2 := Obj1.DM_LogicalDocuments(B1);
+        S1 := 'x';
+        if Client.IsDocumentOpen(Obj2.DM_FullPath) then S1 := 'open' else S1 := 'closed';
+        List1.Add('doc|' + Obj2.DM_DocumentKind + '|' + Obj2.DM_FullPath + '|' + S1);
+    end;
+end;
+Obj3 := SchServer.GetCurrentSchDocument;
+if Obj3 = nil then
+    List1.Add('focused_sch|(none)|0')
+else
+    List1.Add('focused_sch|' + Obj3.DocumentName + '|' + IntToStr(Obj3.ObjectId));
+ResultText := List1.Text;"""
+
+
+@_tool(read_only=True)
+async def get_document_state(ctx: Context, timeout_seconds: int = 120) -> str:
+    """
+    Report the project's documents and which one is focused.
+
+    Every other tool here acts on "whatever is focused", and that changes
+    under you - a user clicking a tab, or EnsureDocumentFocused switching
+    documents as a side effect. Call this when it matters which sheet an
+    edit will land on, and check the focused document before a write.
+
+    A focused ObjectId of 32 is a schematic sheet; 33 is a schematic LIBRARY,
+    which the net-label tools refuse to edit.
+
+    Returns:
+        str: JSON with the project, its documents (kind, path, open) and the
+             focused schematic.
+    """
+    logger.info("get_document_state")
+    payload, images = await _run_sandbox(_DOCSTATE_PAS, timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    project, docs, focused, errors = None, [], None, []
+    for line in (payload.get("result") or "").splitlines():
+        if not line.strip():
+            continue
+        f = line.split("|")
+        if f[0] == "ERR":
+            errors.append(f[1])
+        elif f[0] == "project":
+            project = f[1]
+        elif f[0] == "doc" and len(f) >= 4:
+            docs.append({"kind": f[1], "path": f[2], "open": f[3] == "open"})
+        elif f[0] == "focused_sch" and len(f) >= 3:
+            focused = {"name": f[1], "object_id": int(f[2]),
+                       "is_schematic_sheet": f[2] == "32",
+                       "is_schematic_library": f[2] == "33"}
+    return json.dumps({"success": True, "project": project,
+                       "focused_schematic": focused,
+                       "document_count": len(docs), "documents": docs,
+                       "errors": errors or None}, indent=2)
+
+
+_SAVE_STATE_PAS = """List1 := TStringList.Create;
+Obj3 := nil;
+""" + _PROJECT_PRELUDE + """
+if Obj1 = nil then
+    List1.Add('ERR|no focused project')
+else
+begin
+    List1.Add('project|' + Obj1.DM_ProjectFullPath);
+    I1 := Obj1.DM_LogicalDocumentCount;
+    for B1 := 0 to I1 - 1 do
+    begin
+        Obj2 := Obj1.DM_LogicalDocuments(B1);
+        S1 := Obj2.DM_FullPath;
+        if Client.IsDocumentOpen(S1) then
+        begin
+            Obj3 := Client.GetDocumentByPath(S1);
+            if Obj3 <> nil then
+                List1.Add('doc|' + Obj2.DM_DocumentKind + '|' + S1 + '|' +
+                          BoolToStr(Obj3.Modified, True));
+        end;
+    end;
+end;
+ResultText := List1.Text;"""
+
+
+def _save_script(paths):
+    """Save named documents. DoFileSave('') is verified; Modified goes False."""
+    out = ["List1 := TStringList.Create;", "I1 := 0;"]
+    for p in paths:
+        out.append("Obj2 := Client.GetDocumentByPath(%s);" % _pas_str(p))
+        out.append("if Obj2 = nil then")
+        out.append("    List1.Add('skip|not open|' + %s)" % _pas_str(p))
+        out.append("else")
+        out.append("begin")
+        out.append("    Obj2.DoFileSave('');")
+        out.append("    List1.Add('saved|' + %s + '|still_modified=' +" % _pas_str(p))
+        out.append("              BoolToStr(Obj2.Modified, True));")
+        out.append("    I1 := I1 + 1;")
+        out.append("end;")
+    out.append("List1.Add('count|' + IntToStr(I1));")
+    out.append("ResultText := List1.Text;")
+    return chr(10).join(out)
+
+
+@_tool()
+async def save_documents(ctx: Context, documents: list = None, apply: bool = False,
+                         timeout_seconds: int = 240) -> str:
+    """
+    Save modified Altium documents to disk.
+
+    Nothing else in this server can save. Every edit any tool makes - net
+    labels, wires, symbols, placement - leaves the document dirty in Altium
+    until someone commits it, which is fine for review and useless for an
+    unattended run.
+
+    DEFAULTS TO A PREVIEW (apply=False) listing what is modified. Saving is
+    the point where an edit stops being undoable with Ctrl+Z, so look first.
+
+    Args:
+        documents (list): full paths to save. Defaults to every modified,
+            open document in the focused project.
+        apply (bool): False lists what would be saved; True writes to disk.
+        timeout_seconds (int): how long to wait for Altium.
+
+    Returns:
+        str: JSON with the modified documents and, when applied, what was
+             written and whether each came back clean.
+    """
+    logger.info("save_documents: apply=%s documents=%s" % (apply, documents))
+    payload, images = await _run_sandbox(_SAVE_STATE_PAS, timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+
+    project, docs, errors = None, [], []
+    for line in (payload.get("result") or "").splitlines():
+        if not line.strip():
+            continue
+        f = line.split("|")
+        if f[0] == "ERR":
+            errors.append(f[1])
+        elif f[0] == "project":
+            project = f[1]
+        elif f[0] == "doc" and len(f) >= 4:
+            docs.append({"kind": f[1], "path": f[2], "modified": f[3] == "True"})
+
+    dirty = [d for d in docs if d["modified"]]
+    if documents:
+        documents = [_canon(p) for p in documents]
+        want = set(str(p).lower() for p in documents)
+        targets = [d for d in docs if d["path"].lower() in want]
+        missing = sorted(want - set(d["path"].lower() for d in docs))
+    else:
+        targets, missing = dirty, []
+
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "project": project,
+                           "open_documents": len(docs), "modified": dirty,
+                           "would_save": [d["path"] for d in targets],
+                           "not_open": missing, "errors": errors or None,
+                           "note": "preview only - call again with apply=true. "
+                                   "Saving ends Ctrl+Z recovery for these edits."},
+                          indent=2)
+    if not targets:
+        return json.dumps({"success": True, "applied": True, "saved": 0,
+                           "note": "nothing to save"}, indent=2)
+
+    payload, images = await _run_sandbox(_save_script([d["path"] for d in targets]),
+                                         timeout_seconds)
+    if not payload.get("success"):
+        payload["warning"] = ("FAILED during save. Some documents may already be "
+                              "written - check which.")
+        return _sandbox_return(payload, images)
+
+    saved, skipped, still_dirty = [], [], []
+    for line in (payload.get("result") or "").splitlines():
+        f = line.split("|")
+        if f[0] == "saved":
+            saved.append(f[1])
+            if len(f) > 2 and f[2].endswith("True"):
+                still_dirty.append(f[1])
+        elif f[0] == "skip":
+            skipped.append(f[2] if len(f) > 2 else line)
+    return json.dumps({"success": True, "applied": True, "project": project,
+                       "saved": saved, "saved_count": len(saved),
+                       "skipped_not_open": skipped,
+                       "still_modified_after_save": still_dirty or None,
+                       "warning": ("These edits are now on disk and no longer "
+                                   "revertible with Ctrl+Z.")}, indent=2)
+
+
+def _annotate_script(assignments):
+    """Set designators on components identified by their exact location."""
+    out = [_SHEET_GUARD]
+    for a in assignments:
+        out.append("Obj2 := Obj1.SchIterator_Create;")
+        out.append("Obj5 := nil;")
+        out.append("try")
+        out.append("    Obj3 := Obj2.FirstSchObject;")
+        out.append("    while (Obj3 <> nil) and (Obj5 = nil) do")
+        out.append("    begin")
+        out.append("        if Obj3.ObjectId = eSchComponent then")
+        out.append("            if (Obj3.Location.X = %d) and (Obj3.Location.Y = %d) then"
+                   % (int(a["x"]), int(a["y"])))
+        out.append("                if Obj3.Designator.Text = %s then Obj5 := Obj3;"
+                   % _pas_str(a["from"]))
+        out.append("        Obj3 := Obj2.NextSchObject;")
+        out.append("    end;")
+        out.append("finally")
+        out.append("    Obj1.SchIterator_Destroy(Obj2);")
+        out.append("end;")
+        out.append("if Obj5 <> nil then")
+        out.append("begin")
+        out.append("    SchServer.RobotManager.SendMessage(Obj5.I_ObjectAddress,")
+        out.append("        c_BroadCast, SCHM_BeginModify, c_NoEventData);")
+        out.append("    Obj5.Designator.Text := %s;" % _pas_str(a["to"]))
+        out.append("    SchServer.RobotManager.SendMessage(Obj5.I_ObjectAddress,")
+        out.append("        c_BroadCast, SCHM_EndModify, c_NoEventData);")
+        out.append("    I1 := I1 + 1;")
+        out.append("end;")
+    out.append(_SHEET_CLOSE)
+    return chr(10).join(out)
+
+
+@_tool()
+async def annotate_schematic(ctx: Context, apply: bool = False,
+                             start_at: int = 1, timeout_seconds: int = 300) -> str:
+    """
+    Give unannotated components on the focused sheet real designators.
+
+    A component still called "U?" makes every net touching it provisional -
+    the compiled netlist names those nets NetU?_38 and similar - and blocks
+    updating the PCB. This assigns the next free number per prefix.
+
+    Free numbers are computed from the COMPILED PROJECT, not just this sheet,
+    so a designator already used on another sheet is never reissued. That
+    matters here: this project already contains R22, R23 and TP1 twice.
+
+    MULTI-PART COMPONENTS ARE NOT TOUCHED, and are reported instead. Their
+    placements carry independent UniqueIds (measured: a 3-part MCU had
+    AWIQLVOH / ZRYKKRQV / WTVLSXNI), so nothing in the object model says
+    which placements are one physical part. Deciding that is what Altium's
+    own annotator does from your settings; guessing it would silently merge
+    or split parts. Use Altium's annotator for those, or set them by hand.
+
+    DEFAULTS TO A PREVIEW (apply=False) showing every proposed designator.
+
+    Args:
+        apply (bool): False previews; True assigns.
+        start_at (int): lowest number to consider when looking for a free one.
+        timeout_seconds (int): compiling a large project takes a while.
+
+    Returns:
+        str: JSON with the proposed or applied assignments, and the
+             multi-part components left alone.
+    """
+    logger.info("annotate_schematic: apply=%s" % apply)
+
+    # Project-wide designators, so a number in use on another sheet is not
+    # reissued. This is what stops annotation creating fresh duplicates.
+    script = (_NETLIST_PAS.replace("__COMPONENTS__", _NETLIST_COMPONENTS)
+                          .replace("__NETS__", ""))
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    project, counts, _nets, comps, errors = _parse_netlist(payload.get("result", ""))
+
+    used = {}
+    for c in comps:
+        m = re.match(r"^([A-Za-z_]+)(\d+)$", c["designator"] or "")
+        if m:
+            used.setdefault(m.group(1).upper(), set()).add(int(m.group(2)))
+
+    payload, images = await _run_sandbox(_sch_dump_script(["component"]), timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    doc, objs = _parse_sch_dump(payload.get("result", ""))
+    if not doc.get("is_schematic_sheet"):
+        return json.dumps({"success": False, "document": doc,
+                           "error": "focused document is not a schematic sheet "
+                                    "(ObjectId %s)" % doc.get("object_id")}, indent=2)
+
+    assignments, multipart, unparsed = [], [], []
+    for o in objs:
+        if o.get("kind") != "component" or "?" not in (o.get("designator") or ""):
+            continue
+        if int(o.get("part_count") or 1) > 1:
+            multipart.append({"designator": o["designator"],
+                              "lib_reference": o["lib_reference"],
+                              "part": o.get("current_part_id"),
+                              "part_count": o.get("part_count"),
+                              "x": o["x"], "y": o["y"]})
+            continue
+        prefix = (o["designator"] or "").replace("?", "").upper()
+        if not prefix:
+            unparsed.append(o)
+            continue
+        taken = used.setdefault(prefix, set())
+        n = max(start_at, 1)
+        while n in taken:
+            n += 1
+        taken.add(n)
+        assignments.append({"from": o["designator"], "to": "%s%d" % (prefix, n),
+                            "lib_reference": o["lib_reference"],
+                            "x": o["x"], "y": o["y"]})
+
+    summary = {"to_assign": len(assignments),
+               "multipart_left_alone": len(multipart),
+               "unrecognised_prefix": len(unparsed)}
+
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "project": project,
+                           "document": doc, "summary": summary,
+                           "assignments": assignments,
+                           "multipart_needs_altium_annotator": multipart,
+                           "errors": errors or None,
+                           "note": "preview only - call again with apply=true"},
+                          indent=2)
+    if not assignments:
+        return json.dumps({"success": True, "applied": True, "assigned": 0,
+                           "summary": summary,
+                           "multipart_needs_altium_annotator": multipart,
+                           "note": "nothing to annotate"}, indent=2)
+
+    payload, images = await _run_sandbox(_annotate_script(assignments), timeout_seconds)
+    if not payload.get("success"):
+        payload["warning"] = ("FAILED during annotation. Earlier designators are "
+                              "already assigned - re-run the preview to see what "
+                              "remains.")
+        return _sandbox_return(payload, images)
+    res = (payload.get("result") or "").strip()
+    if res.startswith("ABORT"):
+        return json.dumps({"success": False, "error": res}, indent=2)
+    parts = res.split("|")
+    return json.dumps({"success": True, "applied": True, "document": doc,
+                       "assigned": int(parts[1]) if len(parts) > 1 else None,
+                       "assignments": assignments,
+                       "multipart_needs_altium_annotator": multipart,
+                       "summary": summary,
+                       "undo": "one Ctrl+Z reverts this whole call"}, indent=2)
 
 
 _NEW_LIB_PAS = """List1 := TStringList.Create;
@@ -7053,6 +8365,2419 @@ async def apply_symbol_style(ctx: Context, symbol_name: str, library_path: str =
                                  "line_width": line_width},
                        "note": None if apply else "preview only - call again with apply=true",
                        "undo": "one Ctrl+Z reverts this call" if apply else None}, indent=2)
+
+
+@_tool(read_only=True)
+async def get_schematic_objects(ctx: Context, kinds: list = None, document: str = None,
+                                timeout_seconds: int = 120) -> str:
+    """
+    Dump objects from the schematic sheet currently focused in Altium.
+
+    Unlike get_schematic_data this needs no designators, so it works on sheets
+    that are not annotated yet (components still showing "U?"), and it reports
+    the net-naming objects - net labels, power ports, ports - that carry a
+    design's net names.
+
+    Coordinates are Altium internal units: 1 mil = 10000.
+
+    Pins include connect_x / connect_y, the ELECTRICAL point, which is
+    PinLength along the pin and not Pin.Location. Wires meet that point;
+    matching on Location silently misses every connection.
+
+    Args:
+        kinds (list): any of netlabel, power, port, component, pin, wire,
+            junction, noerc, paramset, harness, signalharness, blanket,
+            sheetsymbol. Defaults to
+            [netlabel, power, port]. harness = a harness connector (x/y is its
+            TOP-LEFT corner) with its entries (each with the electrical point
+            and side: 1 = right edge, 0 = left edge); signalharness = the thick
+            line from the connector to a port, as vertices.
+            Ports report harness_type/width/height/io_type/style/alignment;
+            paramset (a directive: net class, differential pair, ...) reports
+            its visible name plus the hidden parameters that give it meaning
+            (ClassName=..., DifferentialPair=True, ...).
+        timeout_seconds (int): how long to wait for Altium.
+
+    Returns:
+        str: JSON with the document (name, object_id, is_schematic_sheet),
+             per-kind counts, and the objects.
+    """
+    kinds = [str(k).lower() for k in (kinds or ["netlabel", "power", "port"])]
+    if kinds == ["all"]:
+        kinds = list(_SCH_KINDS)
+    bad = [k for k in kinds if k not in _SCH_KINDS]
+    if bad:
+        return json.dumps({"success": False, "error": "unknown kinds: %s" % bad,
+                           "valid_kinds": _SCH_KINDS})
+    logger.info("get_schematic_objects: %s" % kinds)
+    payload, images = await _run_sandbox(_sch_dump_script(kinds, document), timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    doc, objs = _parse_sch_dump(payload.get("result", ""))
+    counts = {}
+    for o in objs:
+        counts[o["kind"]] = counts.get(o["kind"], 0) + 1
+    return json.dumps({"success": True, "document": doc, "counts": counts,
+                       "objects": objs}, indent=2)
+
+
+@_tool(read_only=True)
+async def check_net_labels(ctx: Context, document: str = None, timeout_seconds: int = 120) -> str:
+    """
+    Report which net labels on the focused sheet actually name a net.
+
+    A net label names something only if its location lies ON a wire - and
+    "on" includes mid-segment, not just at a vertex. A label sitting beside a
+    pin, or in a tidy column next to a not-yet-wired symbol, is inert
+    annotation that contributes no net name. Half the labels on a real sheet
+    can be floating with nothing flagging it.
+
+    Run this after renaming or adding labels, and before trusting a sheet's
+    net names.
+
+    Returns:
+        str: JSON listing floating and attached labels, plus names carried by
+             more than one label (those are all one net).
+    """
+    logger.info("check_net_labels")
+    payload, images = await _run_sandbox(_sch_dump_script(["netlabel", "wire"], document),
+                                         timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    doc, objs = _parse_sch_dump(payload.get("result", ""))
+    segs = _wire_segments(objs)
+    attached, floating, names = [], [], {}
+    for o in objs:
+        if o.get("kind") != "netlabel":
+            continue
+        rec = {"text": o["text"], "x": o["x"], "y": o["y"]}
+        hit = any(_point_on_segment((o["x"], o["y"]), a, b) for a, b in segs)
+        (attached if hit else floating).append(rec)
+        names.setdefault(o["text"], []).append(rec)
+    dupes = dict((n, v) for n, v in names.items() if len(v) > 1)
+    return json.dumps({
+        "success": True,
+        "document": doc,
+        "wire_segments": len(segs),
+        "summary": {"total": len(attached) + len(floating),
+                    "attached": len(attached), "floating": len(floating),
+                    "distinct_names": len(names)},
+        "floating_names_nothing": floating,
+        "attached": attached,
+        "duplicate_names_one_net_each": dupes}, indent=2)
+
+
+_SHEET_GUARD = """Obj1 := SchServer.GetCurrentSchDocument;
+if Obj1 = nil then
+    ResultText := 'ABORT|no schematic focused|0'
+else if Obj1.ObjectId <> 32 then
+    ResultText := 'ABORT|not a schematic sheet|' + IntToStr(Obj1.ObjectId)
+else
+begin
+SchServer.ProcessControl.PreProcess(Obj1, '');
+I1 := 0;
+I2 := 0;
+"""
+
+
+_SHEET_CLOSE = """SchServer.ProcessControl.PostProcess(Obj1, '');
+Obj1.GraphicallyInvalidate;
+ResultText := 'OK|' + IntToStr(I1) + '|' + IntToStr(I2);
+end;"""
+
+
+def _draw_wires_script(wires, junctions):
+    """Wires and junctions onto the focused sheet, as one undo transaction."""
+    out = [_SHEET_GUARD]
+    for pts in wires:
+        flat = [int(v) for v in pts]
+        # eCreate_Default, NOT eCreate_GlobalCopy: the global copy clones the
+        # last-edited wire's vertex list (measured 2026-09-19: a 3-vertex
+        # template gave every new wire a spurious third vertex, fanning 56
+        # diagonals across a sheet). The default wire has 0 vertices and the
+        # same LineWidth/Color; there is no DeleteVertex in the API.
+        out.append("Obj4 := SchServer.SchObjectFactory(eWire, eCreate_Default);")
+        out.append("Obj4.Location := Point(%d, %d);" % (flat[0], flat[1]))
+        for i in range(0, len(flat), 2):
+            n = i // 2 + 1
+            out.append("Obj4.InsertVertex := %d;" % n)
+            out.append("Obj4.SetState_Vertex(%d, Point(%d, %d));"
+                       % (n, flat[i], flat[i + 1]))
+        out.append("Obj1.RegisterSchObjectInContainer(Obj4);")
+        out.append("SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,")
+        out.append("    SCHM_PrimitiveRegistration, Obj4.I_ObjectAddress);")
+        out.append("I1 := I1 + 1;")
+    for j in junctions:
+        out.append("Obj4 := SchServer.SchObjectFactory(eJunction, eCreate_GlobalCopy);")
+        out.append("Obj4.Location := Point(%d, %d);" % (int(j["x"]), int(j["y"])))
+        out.append("Obj1.RegisterSchObjectInContainer(Obj4);")
+        out.append("SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,")
+        out.append("    SCHM_PrimitiveRegistration, Obj4.I_ObjectAddress);")
+        out.append("I2 := I2 + 1;")
+    out.append(_SHEET_CLOSE)
+    return chr(10).join(out)
+
+
+@_tool()
+async def draw_schematic_wires(ctx: Context, wires: list = None, junctions: list = None,
+                               apply: bool = False, document: str = None, force: bool = False,
+                               timeout_seconds: int = 180) -> str:
+    """
+    Draw wires and junction dots on the schematic sheet already open.
+
+    build_schematic only creates NEW sheets; this is for wiring up a sheet
+    that exists - the common case when a symbol has been placed and needs
+    connecting.
+
+    DEFAULTS TO A PREVIEW (apply=False). Everything in one call is a single
+    undo step.
+
+    Coordinates are internal units: 1 mil = 10000.
+
+    A wire must END on a pin's electrical point to connect. That point is
+    PinLength along the pin, NOT Pin.Location - get_schematic_objects reports
+    it as connect_x/connect_y. Routing to Pin.Location instead drives the wire
+    through the pin and out the far side, which leaves the pin unconnected and
+    can silently short it to a neighbour sharing the column. Verify with
+    check_schematic_structure afterwards; the preview checks pin endpoints for you.
+
+    Args:
+        wires (list): each a flat list of alternating x,y, e.g.
+            [3900,3000, 5300,3000, 5300,4900] - two segments, three points.
+        junctions (list): [{"x":..,"y":..}] - only where 3+ branches meet.
+        apply (bool): False previews; True draws.
+        timeout_seconds (int): how long to wait for Altium.
+
+    Returns:
+        str: JSON with counts, plus which wire ends land on a pin.
+    """
+    wires = wires or []
+    junctions = junctions or []
+    if not wires and not junctions:
+        return json.dumps({"success": False, "error": "nothing to draw"})
+    for w in wires:
+        if len(w) < 4 or len(w) % 2:
+            return json.dumps({"success": False,
+                               "error": "each wire needs an even count of at least "
+                                        "4 coordinates: %s" % (w,)})
+
+    logger.info("draw_schematic_wires: %d wires, %d junctions, apply=%s"
+                % (len(wires), len(junctions), apply))
+
+    # Read pins so the preview can say whether an end actually lands on one.
+    payload, images = await _run_sandbox(_sch_dump_script(["pin"], document), timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    doc, objs = _parse_sch_dump(payload.get("result", ""))
+    if not doc.get("is_schematic_sheet"):
+        return json.dumps({"success": False, "document": doc,
+                           "error": "focused document is not a schematic sheet "
+                                    "(ObjectId %s)" % doc.get("object_id")}, indent=2)
+    pin_at = {}
+    for o in objs:
+        if o.get("kind") == "pin":
+            pin_at[(o["connect_x"], o["connect_y"])] = "%s.%s" % (
+                o.get("owner_designator", "?"), o.get("designator", "?"))
+
+    ends, warnings = [], []
+    for i, w in enumerate(wires):
+        for (x, y), which in (((w[0], w[1]), "start"), ((w[-2], w[-1]), "end")):
+            hit = pin_at.get((int(x), int(y)))
+            ends.append({"wire": i, "which": which, "x": int(x), "y": int(y),
+                         "on_pin": hit})
+            if not hit:
+                warnings.append("wire %d %s (%d,%d) does not land on a pin "
+                                "connection point" % (i, which, x, y))
+
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc,
+                           "plan": {"wires": len(wires), "junctions": len(junctions)},
+                           "wire_ends": ends, "warnings": warnings,
+                           "note": "preview only - call again with apply=true"},
+                          indent=2)
+
+    payload, images = await _run_sandbox(_target_document(_draw_wires_script(wires, junctions), document),
+                                         timeout_seconds)
+    if not payload.get("success"):
+        payload["warning"] = ("FAILED while drawing. A runtime failure leaves earlier "
+                              "wires already drawn - inspect the sheet before retrying.")
+        return _sandbox_return(payload, images)
+    res = (payload.get("result") or "").strip()
+    if res.startswith("ABORT"):
+        return json.dumps({"success": False, "error": res}, indent=2)
+    parts = res.split("|")
+    return json.dumps({"success": True, "applied": True, "document": doc,
+                       "wires_drawn": int(parts[1]) if len(parts) > 2 else None,
+                       "junctions_drawn": int(parts[2]) if len(parts) > 2 else None,
+                       "wire_ends": ends, "warnings": warnings,
+                       "undo": "one Ctrl+Z reverts this whole call"}, indent=2)
+
+
+_DELETE_KINDS = {"netlabel": "eNetLabel", "wire": "eWire", "junction": "eJunction",
+                 "power": "ePowerObject", "port": "ePort", "noerc": "eNoERC",
+                 "component": "eSchComponent"}
+
+
+def _delete_objects_script(kind_const, match_text, x0, y0, x1, y1, limit):
+    """Delete matching objects, restarting the iterator after each removal.
+
+    The iterator does not survive RemoveSchObject, so this finds one, destroys
+    the iterator, removes, and looks again.
+    """
+    text_test = ""
+    if match_text is not None:
+        text_test = "                if Obj3.Text <> %s then B1 := 1 else B1 := 0;\n" \
+                    % _pas_str(match_text)
+    area_test = ""
+    if x0 is not None:
+        area_test = ("                if (Obj3.Location.X < %d) or (Obj3.Location.X > %d) "
+                     "or (Obj3.Location.Y < %d) or (Obj3.Location.Y > %d) then B1 := 1;\n"
+                     % (int(x0), int(x1), int(y0), int(y1)))
+    return (_SHEET_GUARD +
+            "for I3 := 1 to %d do\nbegin\n" % int(limit) +
+            "    Obj2 := Obj1.SchIterator_Create;\n    Obj5 := nil;\n    try\n"
+            "        Obj3 := Obj2.FirstSchObject;\n"
+            "        while (Obj3 <> nil) and (Obj5 = nil) do\n        begin\n"
+            "            if Obj3.ObjectId = %s then\n            begin\n" % kind_const +
+            "                B1 := 0;\n" + text_test + area_test +
+            "                if B1 = 0 then Obj5 := Obj3;\n"
+            "            end;\n            Obj3 := Obj2.NextSchObject;\n        end;\n"
+            "    finally\n        Obj1.SchIterator_Destroy(Obj2);\n    end;\n"
+            "    if Obj5 <> nil then\n    begin\n"
+            "        Obj1.RemoveSchObject(Obj5);\n"
+            "        SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,\n"
+            "            SCHM_PrimitiveRegistration, Obj5.I_ObjectAddress);\n"
+            "        I1 := I1 + 1;\n    end;\nend;\n" + _SHEET_CLOSE)
+
+
+@_tool()
+async def delete_schematic_objects(ctx: Context, kind: str = None, text: str = None, document: str = None,
+                                   area: list = None, limit: int = 50,
+                                   apply: bool = False, timeout_seconds: int = 180) -> str:
+    """
+    Delete objects from the focused schematic sheet, by kind and optionally by
+    text or bounding box.
+
+    DEFAULTS TO A PREVIEW (apply=False), which lists exactly what would go.
+    Deleting is the least reversible thing here, so look first.
+
+    Args:
+        kind (str): one of netlabel, wire, junction, power, port, noerc,
+            component.
+        text (str): only objects whose Text matches exactly (net labels,
+            power ports).
+        area (list): [x0, y0, x1, y1] in internal units - only objects whose
+            location falls inside.
+        limit (int): safety cap on how many to remove (default 50).
+        apply (bool): False previews; True deletes.
+
+    Returns:
+        str: JSON with the matched objects and, when applied, the count.
+    """
+    if kind not in _DELETE_KINDS:
+        return json.dumps({"success": False, "error": "kind must be one of %s"
+                                                      % sorted(_DELETE_KINDS)})
+    if area is not None and len(area) != 4:
+        return json.dumps({"success": False, "error": "area must be [x0,y0,x1,y1]"})
+    logger.info("delete_schematic_objects: kind=%s text=%r area=%s apply=%s"
+                % (kind, text, area, apply))
+
+    dump_kind = kind if kind in _SCH_KINDS else "netlabel"
+    payload, images = await _run_sandbox(_sch_dump_script([dump_kind], document), timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    doc, objs = _parse_sch_dump(payload.get("result", ""))
+    if not doc.get("is_schematic_sheet"):
+        return json.dumps({"success": False, "document": doc,
+                           "error": "focused document is not a schematic sheet "
+                                    "(ObjectId %s)" % doc.get("object_id")}, indent=2)
+
+    matched = []
+    for o in objs:
+        if o.get("kind") != dump_kind:
+            continue
+        if text is not None and o.get("text") != text:
+            continue
+        if area is not None:
+            x, y = o.get("x"), o.get("y")
+            if x is None or not (area[0] <= x <= area[2] and area[1] <= y <= area[3]):
+                continue
+        matched.append(o)
+
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc,
+                           "would_delete": len(matched), "matched": matched[:limit],
+                           "capped_at": limit,
+                           "note": "preview only - call again with apply=true"},
+                          indent=2)
+    if not matched:
+        return json.dumps({"success": True, "applied": True, "deleted": 0,
+                           "note": "nothing matched"}, indent=2)
+
+    a = area or (None, None, None, None)
+    script = _delete_objects_script(_DELETE_KINDS[kind], text,
+                                    a[0], a[1], a[2], a[3], limit)
+    script = _target_document(script, document)
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        payload["warning"] = ("FAILED while deleting. Earlier removals are already "
+                              "applied - inspect the sheet before retrying.")
+        return _sandbox_return(payload, images)
+    res = (payload.get("result") or "").strip()
+    if res.startswith("ABORT"):
+        return json.dumps({"success": False, "error": res}, indent=2)
+    parts = res.split("|")
+    return json.dumps({"success": True, "applied": True, "document": doc,
+                       "deleted": int(parts[1]) if len(parts) > 1 else None,
+                       "undo": "one Ctrl+Z reverts this whole call"}, indent=2)
+
+
+_PLACE_PAS = """Obj5 := Client.GetDocumentByPath('__TARGET__');
+if Obj5 = nil then
+    ResultText := 'ABORT|target sheet not open|0'
+else
+begin
+Obj2 := Client.OpenDocument('SchLib', '__LIB__');
+if Obj2 = nil then
+    ResultText := 'ABORT|cannot open symbol library|0'
+else
+begin
+    Client.ShowDocument(Obj2);
+    Sleep(800);
+    Obj3 := SchServer.GetCurrentSchDocument;
+    SandboxLog('library current: ' + Obj3.DocumentName);
+    Obj4 := nil;
+    Obj2 := Obj3.SchLibIterator_Create;
+    try
+        Obj1 := Obj2.FirstSchObject;
+        while (Obj1 <> nil) and (Obj4 = nil) do
+        begin
+            if Obj1.ObjectId = eSchComponent then
+                if Obj1.LibReference = '__SYMBOL__' then Obj4 := Obj1;
+            Obj1 := Obj2.NextSchObject;
+        end;
+    finally
+        Obj3.SchIterator_Destroy(Obj2);
+    end;
+    if Obj4 = nil then
+        ResultText := 'ABORT|symbol not found in library|0'
+    else
+    begin
+        SandboxLog('replicating ' + Obj4.LibReference);
+        Obj1 := Obj4.Replicate;
+        Client.ShowDocument(Obj5);
+        Sleep(800);
+        Obj3 := SchServer.GetCurrentSchDocument;
+        SandboxLog('target current: ' + Obj3.DocumentName);
+        if Obj3.ObjectId <> 32 then
+            ResultText := 'ABORT|target is not a schematic sheet|' + IntToStr(Obj3.ObjectId)
+        else
+        begin
+            SchServer.ProcessControl.PreProcess(Obj3, '');
+            Obj1.Designator.Text := '__DESIG__';
+            Obj1.Location := Point(__X__, __Y__);
+            Obj1.DesignItemID := '__ITEMID__';
+            Obj3.RegisterSchObjectInContainer(Obj1);
+            SchServer.RobotManager.SendMessage(Obj3.I_ObjectAddress, c_BroadCast,
+                SCHM_PrimitiveRegistration, Obj1.I_ObjectAddress);
+            SchServer.ProcessControl.PostProcess(Obj3, '');
+            Obj3.GraphicallyInvalidate;
+            ResultText := 'OK|1|' + Obj1.Designator.Text;
+        end;
+    end;
+end;
+end;"""
+
+
+@_tool()
+async def place_schematic_component(ctx: Context, symbol_library: str, symbol: str,
+                                    designator: str, x: int, y: int,
+                                    target_sheet: str = None, design_item_id: str = None,
+                                    timeout_seconds: int = 240) -> str:
+    """
+    Place a component from a symbol library onto a schematic sheet.
+
+    *** DOES NOT CURRENTLY WORK - DO NOT RELY ON IT. ***
+    Measured on a scratch sheet: the replica IS created (the iterator finds
+    it, with the right designator, LibReference and Location) but Altium DOES
+    NOT DRAW IT, and its pins keep library-relative coordinates instead of
+    absolute ones, so any wire routed to them would miss. Every API-level
+    signal reports success; only render_schematic reveals the failure. Left
+    in place because the remaining gap is small and the diagnosis is
+    recorded, but verify with render_schematic before trusting any result.
+
+    Uses the one method that gets closest, per dev/DBLIB_FINDINGS.md:
+    open the source .SchLib, find the symbol, Replicate it, and register the
+    copy on the target sheet. Both documented alternatives are dead ends -
+    IntegratedLibraryManager.PlaceLibraryComponent and the
+    Sch:PlaceIntegratedComponentFromDB process each return without error and
+    place nothing.
+
+    KNOWN LIMITATION: for a database-linked library this produces an UNLINKED
+    shell. The symbol arrives with its library placeholder parameters
+    (VALUE=VALUE, PKG_STYLE=PKG_STL, ...) because this path bypasses Altium's
+    DbLib machinery; database values are not pulled in. Populating them is a
+    separate step.
+
+    Coordinates are internal units: 1 mil = 10000.
+
+    Args:
+        symbol_library (str): full path to the .SchLib holding the symbol.
+        symbol (str): the symbol's LibReference.
+        designator (str): designator for the placed part, e.g. "R12" or "U?".
+        x, y (int): placement location in internal units.
+        target_sheet (str): sheet to place on; defaults to the focused one.
+            It must already be open.
+        design_item_id (str): DesignItemID to stamp; defaults to the symbol.
+
+    Returns:
+        str: JSON with the placement result.
+    """
+    target = _canon(target_sheet)
+    symbol_library = _canon(symbol_library)
+    if not target:
+        payload, images = await _run_sandbox(_sch_dump_script([]), 120)
+        if not payload.get("success"):
+            return _sandbox_return(payload, images)
+        info, _ = _parse_sch_dump(payload.get("result", ""))
+        if not info.get("is_schematic_sheet"):
+            return json.dumps({"success": False, "document": info,
+                               "error": "focused document is not a schematic sheet; "
+                                        "pass target_sheet="}, indent=2)
+        target = info.get("name")
+
+    logger.info("place_schematic_component: %s from %s -> %s" % (symbol, symbol_library, target))
+    script = (_PLACE_PAS.replace("__TARGET__", str(target))
+                        .replace("__LIB__", str(symbol_library))
+                        .replace("__SYMBOL__", str(symbol))
+                        .replace("__DESIG__", str(designator))
+                        .replace("__X__", str(int(x)))
+                        .replace("__Y__", str(int(y)))
+                        .replace("__ITEMID__", str(design_item_id or symbol)))
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    res = (payload.get("result") or "").strip()
+    if res.startswith("ABORT"):
+        return json.dumps({"success": False, "error": res, "target_sheet": target},
+                          indent=2)
+    parts = res.split("|")
+    return json.dumps({"success": True, "target_sheet": target, "symbol": symbol,
+                       "designator": parts[2] if len(parts) > 2 else designator,
+                       "x": int(x), "y": int(y),
+                       "warning": "UNRELIABLE: the replica is created in the object "
+                                  "model but measured NOT to render, and its pins keep "
+                                  "library-relative coordinates. Verify with "
+                                  "render_schematic before building on this.",
+                       "note": "database-linked libraries also place as an unlinked "
+                               "shell - parameters keep library placeholder values",
+                       "undo": "one Ctrl+Z reverts this placement"}, indent=2)
+
+
+def _set_net_labels_script(renames, add, delete):
+    """Build the DelphiScript applying one net-label edit as a single undo
+    transaction.
+
+    Split out from the tool so the emitted script can be tested without an
+    Altium instance - the expensive way to find a mistake in generated
+    DelphiScript is a runtime failure halfway through modifying a sheet.
+    """
+    lines = ["Obj1 := SchServer.GetCurrentSchDocument;",
+             "if Obj1.ObjectId <> %d then" % SCH_DOC_OBJECTID,
+             "    ResultText := 'ABORT|not a schematic sheet|' + IntToStr(Obj1.ObjectId)",
+             "else", "begin", "List1 := TStringList.Create;"]
+    for old, new in renames.items():
+        lines.append("List1.Add(%s);" % _pas_str(old + "=" + new))
+    lines += ["I1 := 0;", "I2 := 0;", "I3 := 0;",
+              "SchServer.ProcessControl.PreProcess(Obj1, '');"]
+    if renames:
+        lines += [
+            "Obj2 := Obj1.SchIterator_Create;", "try",
+            "    Obj3 := Obj2.FirstSchObject;", "    while Obj3 <> nil do", "    begin",
+            "        if Obj3.ObjectId = eNetLabel then", "        begin",
+            "            B1 := List1.IndexOfName(Obj3.Text);",
+            "            if B1 >= 0 then", "            begin",
+            "                S1 := List1.ValueFromIndex[B1];",
+            "                SchServer.RobotManager.SendMessage(Obj3.I_ObjectAddress,",
+            "                    c_BroadCast, SCHM_BeginModify, c_NoEventData);",
+            "                Obj3.Text := S1;",
+            "                SchServer.RobotManager.SendMessage(Obj3.I_ObjectAddress,",
+            "                    c_BroadCast, SCHM_EndModify, c_NoEventData);",
+            "                I1 := I1 + 1;", "            end;", "        end;",
+            "        Obj3 := Obj2.NextSchObject;", "    end;", "finally",
+            "    Obj1.SchIterator_Destroy(Obj2);", "end;"]
+    for d in delete:
+        # Find-one-then-restart: the iterator does not survive a removal.
+        lines += [
+            "for B1 := 1 to 200 do", "begin",
+            "    Obj2 := Obj1.SchIterator_Create;", "    Obj5 := nil;", "    try",
+            "        Obj3 := Obj2.FirstSchObject;",
+            "        while (Obj3 <> nil) and (Obj5 = nil) do", "        begin",
+            "            if Obj3.ObjectId = eNetLabel then",
+            "                if Obj3.Text = %s then Obj5 := Obj3;" % _pas_str(d),
+            "            Obj3 := Obj2.NextSchObject;", "        end;", "    finally",
+            "        Obj1.SchIterator_Destroy(Obj2);", "    end;",
+            "    if Obj5 <> nil then", "    begin",
+            "        Obj1.RemoveSchObject(Obj5);",
+            "        SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,",
+            "            SCHM_PrimitiveRegistration, Obj5.I_ObjectAddress);",
+            "        I2 := I2 + 1;", "    end;", "end;"]
+    for a in add:
+        lines += [
+            "Obj4 := SchServer.SchObjectFactory(eNetLabel, eCreate_Default);",
+            "Obj4.Text := %s;" % _pas_str(a["text"]),
+            "Obj4.Location := Point(%d, %d);" % (int(a["x"]), int(a["y"])),
+            "Obj4.Orientation := %d;" % int(a.get("orientation", 0)),
+            "Obj4.Justification := %d;" % int(a.get("justification", 0)),
+            "Obj4.FontID := %d;" % int(a.get("font_id", 1)),
+            "Obj1.RegisterSchObjectInContainer(Obj4);",
+            "SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,",
+            "    SCHM_PrimitiveRegistration, Obj4.I_ObjectAddress);",
+            "I3 := I3 + 1;"]
+    lines += ["SchServer.ProcessControl.PostProcess(Obj1, '');",
+              "ResultText := 'OK|' + IntToStr(I1) + '|' + IntToStr(I2) + '|' "
+              "+ IntToStr(I3);",
+              "end;"]
+
+    return chr(10).join(lines)
+
+
+@_tool()
+async def set_net_labels(ctx: Context, renames: dict = None, add: list = None,
+                         delete: list = None, apply: bool = False, document: str = None,
+                         force: bool = False, timeout_seconds: int = 180) -> str:
+    """
+    Rename, add and delete net labels on the focused schematic sheet.
+
+    DEFAULTS TO A PREVIEW - nothing is written unless apply=True. The preview
+    reports what would change and what would collide: renames whose target
+    already exists (those MERGE two nets into one), deletes matching nothing,
+    and added labels landing where there is no wire (so naming nothing).
+
+    Everything applied in one call is a SINGLE undo step in Altium.
+
+    Refuses to run unless the focused document is a schematic sheet
+    (ObjectId 32). A schematic library is 33 and must never be edited this way.
+
+    Args:
+        renames (dict): {old_text: new_text}. Every label with that exact text
+            is renamed, wherever it sits on the sheet.
+        add (list): [{"text":..., "x":..., "y":..., "orientation":0}] in
+            internal units (1 mil = 10000). To name a net, x/y must lie ON a
+            wire.
+        delete (list): label texts to remove entirely.
+        apply (bool): False (default) previews; True writes.
+        timeout_seconds (int): how long to wait for Altium.
+
+    Returns:
+        str: JSON with planned or applied counts plus any collisions.
+    """
+    renames = dict((str(k), str(v)) for k, v in (renames or {}).items())
+    add = add or []
+    delete = [str(d) for d in (delete or [])]
+    if not renames and not add and not delete:
+        return json.dumps({"success": False, "error": "nothing to do"})
+    for a in add:
+        if not all(k in a for k in ("text", "x", "y")):
+            return json.dumps({"success": False,
+                               "error": "add entries need text, x and y: %s" % (a,)})
+
+    logger.info("set_net_labels: %d renames, %d adds, %d deletes, apply=%s"
+                % (len(renames), len(add), len(delete), apply))
+
+    # Read current state first: the preview, the collision report and the
+    # is-this-a-sheet guard all depend on it.
+    payload, images = await _run_sandbox(_sch_dump_script(["netlabel", "wire"], document),
+                                         timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    doc, objs = _parse_sch_dump(payload.get("result", ""))
+    if not doc.get("is_schematic_sheet"):
+        return json.dumps({
+            "success": False,
+            "error": "focused document is not a schematic sheet (ObjectId %s; "
+                     "33 is a library)" % doc.get("object_id"),
+            "document": doc}, indent=2)
+
+    existing = [o for o in objs if o.get("kind") == "netlabel"]
+    by_text = {}
+    for o in existing:
+        by_text.setdefault(o["text"], []).append(o)
+    segs = _wire_segments(objs)
+
+    warnings = []
+    for old, new in renames.items():
+        if old not in by_text:
+            warnings.append("rename source not found on this sheet: %r" % old)
+        if new in by_text and new != old:
+            warnings.append("rename target %r already exists (%d label(s)) - these "
+                            "MERGE into one net" % (new, len(by_text[new])))
+        if new in renames and renames[new] != new:
+            warnings.append("chain rename: %r is also a rename source" % new)
+    for d in delete:
+        if d not in by_text:
+            warnings.append("delete target not found: %r" % d)
+    for a in add:
+        p = (int(a["x"]), int(a["y"]))
+        if not any(_point_on_segment(p, s, e) for s, e in segs):
+            warnings.append("added label %r at %s is not on a wire - it will name "
+                            "nothing" % (a["text"], p))
+        if any(o["x"] == p[0] and o["y"] == p[1] for o in existing):
+            warnings.append("added label %r lands on an existing label at %s"
+                            % (a["text"], p))
+
+    plan = {"renames_matching_labels": sum(len(by_text.get(k, [])) for k in renames),
+            "deletes_matching_labels": sum(len(by_text.get(d, [])) for d in delete),
+            "adds": len(add)}
+
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc,
+                           "plan": plan, "warnings": warnings,
+                           "note": "preview only - call again with apply=true to write"},
+                          indent=2)
+    blocked = _blocking(warnings, ("is not on a wire",))
+    if blocked and not force:
+        return json.dumps({"success": False, "applied": False, "document": doc,
+                           "error": "refused: these labels would name nothing (pass force=true to "
+                                    "place them anyway)", "blocked": blocked, "warnings": warnings}, indent=2)
+
+    script = _target_document(_set_net_labels_script(renames, add, delete), document)
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        payload["warning"] = ("The script FAILED while modifying the sheet. A runtime "
+                              "failure leaves earlier changes applied - inspect the "
+                              "sheet before retrying.")
+        payload["plan"] = plan
+        return _sandbox_return(payload, images)
+
+    res = (payload.get("result") or "").strip()
+    if res.startswith("ABORT"):
+        return json.dumps({"success": False, "error": res}, indent=2)
+    parts = res.split("|")
+    ok = len(parts) > 3
+    return json.dumps({
+        "success": True, "applied": True, "document": doc,
+        "renamed": int(parts[1]) if ok else None,
+        "deleted": int(parts[2]) if ok else None,
+        "added": int(parts[3]) if ok else None,
+        "plan": plan, "warnings": warnings,
+        "undo": "one Ctrl+Z in Altium reverts this whole call",
+        "raw": res}, indent=2)
+
+
+_MATCH_FIELDS = {
+    "paramset": ("eParameterSet", {"name": "Name"}),
+    "port": ("ePort", {"name": "Name"}),
+    "netlabel": ("eNetLabel", {"text": "Text"}),
+    "power": ("ePowerObject", {"text": "Text"}),
+    "component": ("eSchComponent", {"designator": "Designator.Text",
+                                    "lib_reference": "LibReference"}),
+    "noerc": ("eNoERC", {}),
+    "junction": ("eJunction", {}),
+}
+
+
+def _match_condition(kind, match, var="Obj3"):
+    """Pascal boolean selecting objects of `kind` that satisfy `match`.
+
+    match keys: the kind's text field(s) (name / text / designator /
+    lib_reference), plus optional exact x / y in internal units.
+    """
+    if kind not in _MATCH_FIELDS:
+        raise ValueError("unknown kind %r (one of %s)" % (kind, sorted(_MATCH_FIELDS)))
+    const, fields = _MATCH_FIELDS[kind]
+    terms = ["(%s.ObjectId = %s)" % (var, const)]
+    for key, member in fields.items():
+        if match.get(key) is not None:
+            terms.append("(%s.%s = %s)" % (var, member, _pas_str(match[key])))
+    if match.get("x") is not None:
+        terms.append("(%s.Location.X = %d)" % (var, int(match["x"])))
+    if match.get("y") is not None:
+        terms.append("(%s.Location.Y = %d)" % (var, int(match["y"])))
+    return " and ".join(terms)
+
+
+def _object_matches(kind, match, obj):
+    """Python twin of _match_condition, for the preview."""
+    if obj.get("kind") != kind:
+        return False
+    _, fields = _MATCH_FIELDS[kind]
+    for key in fields:
+        if match.get(key) is not None and str(obj.get(key)) != str(match[key]):
+            return False
+    for key in ("x", "y"):
+        if match.get(key) is not None and int(obj.get(key, 0)) != int(match[key]):
+            return False
+    return True
+
+
+_SCRIPT_HEAD = ["Obj1 := SchServer.GetCurrentSchDocument;",
+                "if Obj1.ObjectId <> %d then" % SCH_DOC_OBJECTID,
+                "    ResultText := 'ABORT|not a schematic sheet|' + IntToStr(Obj1.ObjectId)",
+                "else", "begin",
+                "I1 := 0;", "I2 := 0;", "I3 := 0;",
+                "SchServer.ProcessControl.PreProcess(Obj1, '');"]
+
+
+def _script_tail(counters):
+    expr = " + '|' + ".join("IntToStr(%s)" % c for c in counters)
+    return ["SchServer.ProcessControl.PostProcess(Obj1, '');",
+            "Obj1.GraphicallyInvalidate;",
+            "ResultText := 'OK|' + %s;" % expr, "end;"]
+
+
+def _modify_block(var, statements):
+    """Pair property writes with begin/end modify (see ALTIUM_SCRIPT_API.md)."""
+    return (["SchServer.RobotManager.SendMessage(%s.I_ObjectAddress," % var,
+             "    c_BroadCast, SCHM_BeginModify, c_NoEventData);"]
+            + statements
+            + ["SchServer.RobotManager.SendMessage(%s.I_ObjectAddress," % var,
+               "    c_BroadCast, SCHM_EndModify, c_NoEventData);"])
+
+
+def _for_each_match(kind, match, statements):
+    """Iterate the sheet once, applying `statements` to every matching object.
+
+    Safe for in-place edits (move, rename); NOT for removal - see
+    _remove_matches for that.
+    """
+    return (["Obj2 := Obj1.SchIterator_Create;", "try",
+             "    Obj3 := Obj2.FirstSchObject;", "    while Obj3 <> nil do", "    begin",
+             "        if %s then" % _match_condition(kind, match), "        begin"]
+            + ["            " + st for st in statements]
+            + ["        end;", "        Obj3 := Obj2.NextSchObject;", "    end;",
+               "finally", "    Obj1.SchIterator_Destroy(Obj2);", "end;"])
+
+
+def _remove_matches(kind, match, counter="I3"):
+    """Find-one-then-restart removal: an iterator does not survive RemoveSchObject."""
+    return (["for B1 := 1 to 200 do", "begin",
+             "    Obj2 := Obj1.SchIterator_Create;", "    Obj5 := nil;", "    try",
+             "        Obj3 := Obj2.FirstSchObject;",
+             "        while (Obj3 <> nil) and (Obj5 = nil) do", "        begin",
+             "            if %s then Obj5 := Obj3;" % _match_condition(kind, match),
+             "            Obj3 := Obj2.NextSchObject;", "        end;", "    finally",
+             "        Obj1.SchIterator_Destroy(Obj2);", "    end;",
+             "    if Obj5 <> nil then", "    begin",
+             "        Obj1.RemoveSchObject(Obj5);",
+             "        SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,",
+             "            SCHM_PrimitiveRegistration, Obj5.I_ObjectAddress);",
+             "        %s := %s + 1;" % (counter, counter), "    end;", "end;"])
+
+
+def _register(var):
+    return ["Obj1.RegisterSchObjectInContainer(%s);" % var,
+            "SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,",
+            "    SCHM_PrimitiveRegistration, %s.I_ObjectAddress);" % var]
+
+
+def _move_objects_script(moves):
+    """One undo step moving every matching object of each move.
+
+    A move is {"kind", "match", "to": [x, y]} or {"kind", "match", "by": [dx, dy]}.
+    MoveByXY is used rather than assigning Location because it carries the
+    children along - a parameter set's hidden parameters, a component's pins.
+    Measured: Location assignment on a container leaves children behind.
+    """
+    lines = list(_SCRIPT_HEAD)
+    for m in moves:
+        if "to" in m:
+            tx, ty = int(m["to"][0]), int(m["to"][1])
+            move = "Obj3.MoveByXY(%d - Obj3.Location.X, %d - Obj3.Location.Y);" % (tx, ty)
+        else:
+            dx, dy = int(m["by"][0]), int(m["by"][1])
+            move = "Obj3.MoveByXY(%d, %d);" % (dx, dy)
+        lines += _for_each_match(m["kind"], m.get("match", {}),
+                                 _modify_block("Obj3", [move]) + ["I1 := I1 + 1;"])
+    lines += _script_tail(["I1"])
+    return chr(10).join(lines)
+
+
+def _paramset_params(entry):
+    params = dict(entry.get("params") or {})
+    if entry.get("class_name"):
+        params.setdefault("ClassName", entry["class_name"])
+    return params
+
+
+def _set_paramsets_script(add, rename, delete):
+    """One undo step creating / renaming / deleting parameter-set directives.
+
+    add:    {"name", "x", "y", "orientation"=1, "color"=255,
+             "class_name" | "params": {ParamName: text}}  (params are hidden)
+    rename: {"match": {...}, "name"?: new visible name, "params"?: {ParamName: text}}
+    delete: [match, ...]
+    """
+    lines = list(_SCRIPT_HEAD)
+    for r in rename:
+        sts = []
+        if r.get("name") is not None:
+            sts.append("Obj3.Name := %s;" % _pas_str(r["name"]))
+        if r.get("class_name"):
+            r = dict(r); r.setdefault("params", {}); r["params"]["ClassName"] = r["class_name"]
+        for pname, ptext in (r.get("params") or {}).items():
+            sts += ["Obj4 := Obj3.SchIterator_Create;", "try",
+                    "    Obj4.AddFilter_ObjectSet(MkSet(eParameter));",
+                    "    Obj5 := Obj4.FirstSchObject;", "    while Obj5 <> nil do",
+                    "    begin",
+                    "        if Obj5.Name = %s then" % _pas_str(pname)]
+            sts += ["        begin"] + ["            " + x for x in _modify_block(
+                "Obj5", ["Obj5.Text := %s;" % _pas_str(ptext)])] + ["        end;"]
+            sts += ["        Obj5 := Obj4.NextSchObject;", "    end;", "finally",
+                    "    Obj3.SchIterator_Destroy(Obj4);", "end;"]
+        lines += _for_each_match("paramset", r.get("match", {}),
+                                 _modify_block("Obj3", sts) + ["I1 := I1 + 1;"])
+    for d in delete:
+        lines += _remove_matches("paramset", d, "I3")
+    for a in add:
+        lines += ["Obj4 := SchServer.SchObjectFactory(eParameterSet, eCreate_Default);",
+                  "Obj4.Name := %s;" % _pas_str(a["name"]),
+                  "Obj4.Location := Point(%d, %d);" % (int(a["x"]), int(a["y"])),
+                  "Obj4.Orientation := %d;" % int(a.get("orientation", 1)),
+                  "Obj4.Color := %d;" % int(a.get("color", 255)),
+                  "Obj4.Style := %d;" % int(a.get("style", 1))]
+        for pname, ptext in _paramset_params(a).items():
+            lines += ["Obj5 := SchServer.SchObjectFactory(eParameter, eCreate_Default);",
+                      "Obj5.Name := %s;" % _pas_str(pname),
+                      "Obj5.Text := %s;" % _pas_str(ptext),
+                      "Obj5.IsHidden := True;",
+                      "Obj4.AddSchObject(Obj5);"]
+        lines += _register("Obj4") + ["I2 := I2 + 1;"]
+    lines += _script_tail(["I1", "I2", "I3"])
+    return chr(10).join(lines)
+
+
+_PORT_DEFAULTS = {"height": 1000000, "io_type": 0, "style": 0, "alignment": 0,
+                  "color": 128, "area_color": 8454143, "text_color": 128, "font_id": 1}
+
+
+_PORT_MEMBERS = {"name": ("Name", str), "harness_type": ("HarnessType", str),
+                 "width": ("Width", int), "height": ("Height", int),
+                 "io_type": ("IOType", int), "style": ("Style", int),
+                 "alignment": ("Alignment", int), "color": ("Color", int),
+                 "area_color": ("AreaColor", int), "text_color": ("TextColor", int),
+                 "font_id": ("FontID", int)}
+
+
+def _port_assignments(var, props):
+    out = []
+    for key, (member, typ) in _PORT_MEMBERS.items():
+        if props.get(key) is not None:
+            val = _pas_str(props[key]) if typ is str else str(int(props[key]))
+            out.append("%s.%s := %s;" % (var, member, val))
+    return out
+
+
+def _set_ports_script(add, rename, delete):
+    """One undo step creating / editing / deleting ports.
+
+    add:    {"name", "x", "y", "width", "harness_type"?, + any _PORT_MEMBERS key}
+    rename: {"match": {...}, + any _PORT_MEMBERS key to set}
+    delete: [match, ...]
+    """
+    lines = list(_SCRIPT_HEAD)
+    for r in rename:
+        props = {k: v for k, v in r.items() if k in _PORT_MEMBERS}
+        lines += _for_each_match("port", r.get("match", {}),
+                                 _modify_block("Obj3", _port_assignments("Obj3", props))
+                                 + ["I1 := I1 + 1;"])
+    for d in delete:
+        lines += _remove_matches("port", d, "I3")
+    for a in add:
+        props = dict(_PORT_DEFAULTS)
+        props.update({k: v for k, v in a.items() if k in _PORT_MEMBERS})
+        lines += ["Obj4 := SchServer.SchObjectFactory(ePort, eCreate_Default);",
+                  "Obj4.Location := Point(%d, %d);" % (int(a["x"]), int(a["y"]))]
+        lines += _port_assignments("Obj4", props)
+        lines += _register("Obj4") + ["I2 := I2 + 1;"]
+    lines += _script_tail(["I1", "I2", "I3"])
+    return chr(10).join(lines)
+
+
+def _blocking(warnings, needles):
+    """Warnings that describe an edit that is always wrong on a real sheet."""
+    return [w for w in warnings if any(n in w for n in needles)]
+
+
+def _in_rect(x, y, area):
+    x0, y0, x1, y1 = [int(v) for v in area]
+    return min(x0, x1) <= int(x) <= max(x0, x1) and min(y0, y1) <= int(y) <= max(y0, y1)
+
+
+def _obj_inside(o, area):
+    """An object is inside when every vertex (wires, harnesses) or its anchor is."""
+    if o.get("kind") in ("wire", "signalharness"):
+        vs = o.get("vertices") or []
+        return bool(vs) and all(_in_rect(v["x"], v["y"], area) for v in vs)
+    if o.get("kind") == "blanket":
+        return _in_rect(o["x0"], o["y0"], area) and _in_rect(o["x1"], o["y1"], area)
+    return _in_rect(o.get("x", 0), o.get("y", 0), area)
+
+
+_AREA_KINDS = ("wire", "netlabel", "paramset", "port", "harness", "signalharness", "component",
+               "power", "noerc", "junction")
+
+
+_AREA_CONSTS = {"wire": "eWire", "netlabel": "eNetLabel", "paramset": "eParameterSet", "port": "ePort",
+                "harness": "eHarnessConnector", "signalharness": "eSignalHarness",
+                "component": "eSchComponent", "power": "ePowerObject", "noerc": "eNoERC",
+                "junction": "eJunction"}
+
+
+def _area_condition(area, kinds, exclude_lib_refs):
+    """Pascal: is Obj3 (kind in kinds) inside `area`? Wires/harnesses need every vertex in."""
+    x0, y0, x1, y1 = [int(v) for v in area]
+    x0, x1 = min(x0, x1), max(x0, x1)
+    y0, y1 = min(y0, y1), max(y0, y1)
+    kind_test = " or ".join("(Obj3.ObjectId = %s)" % _AREA_CONSTS[k] for k in kinds)
+    lines = ["B2 := 0;",
+             "if %s then" % kind_test, "begin",
+             "    B2 := 1;",
+             "    if (Obj3.ObjectId = eWire) or (Obj3.ObjectId = eSignalHarness) then",
+             "    begin",
+             "        for I4 := 1 to Obj3.VerticesCount do",
+             "            if (Obj3.Vertex[I4].X < %d) or (Obj3.Vertex[I4].X > %d) or (Obj3.Vertex[I4].Y < %d) or (Obj3.Vertex[I4].Y > %d) then B2 := 0;" % (x0, x1, y0, y1),
+             "    end",
+             "    else if (Obj3.Location.X < %d) or (Obj3.Location.X > %d) or (Obj3.Location.Y < %d) or (Obj3.Location.Y > %d) then B2 := 0;" % (x0, x1, y0, y1)]
+    for ref in exclude_lib_refs or []:
+        lines.append("    if (Obj3.ObjectId = eSchComponent) then if Obj3.LibReference = %s then B2 := 0;" % _pas_str(ref))
+    lines.append("end;")
+    return lines
+
+
+def _rename_copy_pas(var, renames):
+    """Apply {old: new} to every text field of a fresh copy `var` (label text,
+    port name, directive name + ClassName, connector type + entry names,
+    component designator). List2 holds the map as name=value pairs."""
+    if not renames:
+        return []
+    return [
+        "if %s.ObjectId = eNetLabel then if List2.IndexOfName(%s.Text) >= 0 then %s.Text := List2.Values[%s.Text];" % (var, var, var, var),
+        "if %s.ObjectId = ePort then if List2.IndexOfName(%s.Name) >= 0 then %s.Name := List2.Values[%s.Name];" % (var, var, var, var),
+        "if %s.ObjectId = eSchComponent then if List2.IndexOfName(%s.Designator.Text) >= 0 then %s.Designator.Text := List2.Values[%s.Designator.Text];" % (var, var, var, var),
+        "if %s.ObjectId = eParameterSet then" % var, "begin",
+        "    if List2.IndexOfName(%s.Name) >= 0 then %s.Name := List2.Values[%s.Name];" % (var, var, var),
+        "    Obj7 := %s.SchIterator_Create;" % var,
+        "    Obj7.AddFilter_ObjectSet(MkSet(eParameter));",
+        "    Obj8 := Obj7.FirstSchObject;",
+        "    while Obj8 <> nil do", "    begin",
+        "        if List2.IndexOfName(Obj8.Text) >= 0 then Obj8.Text := List2.Values[Obj8.Text];",
+        "        Obj8 := Obj7.NextSchObject;", "    end;",
+        "    %s.SchIterator_Destroy(Obj7);" % var, "end;",
+        "if %s.ObjectId = eHarnessConnector then" % var, "begin",
+        "    if List2.IndexOfName(%s.HarnessType) >= 0 then %s.HarnessType := List2.Values[%s.HarnessType];" % (var, var, var),
+        "    Obj7 := %s.SchIterator_Create;" % var,
+        "    Obj7.AddFilter_ObjectSet(MkSet(eHarnessEntry));",
+        "    Obj8 := Obj7.FirstSchObject;",
+        "    while Obj8 <> nil do", "    begin",
+        "        if List2.IndexOfName(Obj8.Name) >= 0 then Obj8.Name := List2.Values[Obj8.Name];",
+        "        Obj8 := Obj7.NextSchObject;", "    end;",
+        "    %s.SchIterator_Destroy(Obj7);" % var, "end;"]
+
+
+def _area_script(area, dx, dy, mode, kinds=None, exclude_lib_refs=None, renames=None):
+    """Copy (Replicate + move + register) or move every object inside `area`.
+
+    Three passes over the sheet, using the Selection flag as the bookkeeping
+    bit: clear every selection, select what is inside NOW, then act on the
+    selected objects only and deselect each as it is handled. A copy is
+    registered with Selection False, so a shift that leaves a copy inside the
+    area cannot chain. (I_ObjectAddress cannot be stringified through late
+    binding, so an address list is not an option.)"""
+    kinds = list(kinds or _AREA_KINDS)
+    # Every pass filters the iterator to the kinds we act on: the unfiltered
+    # iterator also yields sheet-level objects without a Selection member
+    # ("Undeclared identifier: Selection" - measured on a fresh sheet).
+    flt = "    Obj2.AddFilter_ObjectSet(MkSet(%s));" % ", ".join(_AREA_CONSTS[k] for k in kinds)
+    lines = list(_SCRIPT_HEAD)
+    for k, v in (renames or {}).items():
+        lines.append("List2.Add(%s);" % _pas_str("%s=%s" % (k, v)))
+    lines += ["Obj2 := Obj1.SchIterator_Create;", flt, "try", "    Obj3 := Obj2.FirstSchObject;",
+              "    while Obj3 <> nil do", "    begin", "        Obj3.Selection := False;",
+              "        Obj3 := Obj2.NextSchObject;", "    end;", "finally",
+              "    Obj1.SchIterator_Destroy(Obj2);", "end;",
+              "Obj2 := Obj1.SchIterator_Create;", flt, "try", "    Obj3 := Obj2.FirstSchObject;",
+              "    while Obj3 <> nil do", "    begin"]
+    lines += ["        " + l for l in _area_condition(area, kinds, exclude_lib_refs)]
+    lines += ["        if B2 = 1 then", "        begin", "            Obj3.Selection := True;",
+              "            I3 := I3 + 1;", "        end;",
+              "        Obj3 := Obj2.NextSchObject;", "    end;", "finally",
+              "    Obj1.SchIterator_Destroy(Obj2);", "end;",
+              "Obj2 := Obj1.SchIterator_Create;", flt, "try", "    Obj3 := Obj2.FirstSchObject;",
+              "    while Obj3 <> nil do", "    begin",
+              "        if Obj3.Selection = True then", "        begin",
+              "            Obj3.Selection := False;"]
+    if mode == "copy":
+        lines += ["            Obj5 := Obj3.Replicate;",
+                  "            Obj5.Selection := False;",
+                  "            Obj5.MoveByXY(%d, %d);" % (int(dx), int(dy))]
+        lines += ["            " + l for l in _rename_copy_pas("Obj5", renames)]
+        lines += ["            " + l for l in _register("Obj5")]
+        lines += ["            I2 := I2 + 1;"]
+    else:
+        lines += ["            " + l for l in _modify_block("Obj3", ["Obj3.MoveByXY(%d, %d);" % (int(dx), int(dy))])]
+        lines += ["            I1 := I1 + 1;"]
+    lines += ["        end;", "        Obj3 := Obj2.NextSchObject;", "    end;", "finally",
+              "    Obj1.SchIterator_Destroy(Obj2);", "end;"]
+    lines += _script_tail(["I1", "I2", "I3"])
+    return chr(10).join(lines)
+
+
+def _copy_component_script(designator, lib_reference, to_x, to_y, new_designator):
+    lines = list(_SCRIPT_HEAD)
+    lines += ["Obj3 := SbFind(Obj1, eSchComponent, %s, -1, -1);" % _pas_str(designator)]
+    if lib_reference:
+        lines += ["if Obj3 <> nil then if Obj3.LibReference <> %s then Obj3 := nil;" % _pas_str(lib_reference)]
+    lines += ["if Obj3 = nil then begin ResultText := 'ABORT|component %s not found'; "
+              "Exit; end;" % str(designator).replace("'", ""),
+              "Obj5 := Obj3.Replicate;",
+              "Obj5.MoveByXY(%d - Obj3.Location.X, %d - Obj3.Location.Y);" % (int(to_x), int(to_y))]
+    if new_designator:
+        lines += ["Obj5.Designator.Text := %s;" % _pas_str(new_designator)]
+    lines += _register("Obj5") + ["I2 := I2 + 1;"]
+    lines += _script_tail(["I1", "I2", "I3"])
+    return chr(10).join(lines)
+
+
+def _plan_matches(items, objs, label):
+    """Count what each match selects; warn on nothing and on ambiguous 'to' moves."""
+    plan, warnings = [], []
+    for it in items:
+        kind = it.get("kind", "paramset")
+        hits = [o for o in objs if _object_matches(kind, it.get("match", {}), o)]
+        plan.append({label: it, "matches": len(hits)})
+        if not hits:
+            warnings.append("%s matches nothing on this sheet: %s" % (label, it.get("match", it)))
+        elif "to" in it and len(hits) > 1:
+            warnings.append("move 'to' matches %d objects - they would stack at one point: %s"
+                            % (len(hits), it.get("match")))
+    return plan, warnings
+
+
+async def _sheet_state(kinds, timeout_seconds, document=None):
+    payload, images = await _run_sandbox(_sch_dump_script(kinds, document), timeout_seconds)
+    if not payload.get("success"):
+        return None, None, _sandbox_return(payload, images)
+    doc, objs = _parse_sch_dump(payload.get("result", ""))
+    if not doc.get("is_schematic_sheet"):
+        return None, None, json.dumps({
+            "success": False,
+            "error": "focused document is not a schematic sheet (ObjectId %s; "
+                     "33 is a library)" % doc.get("object_id"),
+            "document": doc}, indent=2)
+    return doc, objs, None
+
+
+async def _verify_added(expect, kinds, document, timeout_seconds):
+    """Re-dump and confirm the objects an apply claims to have created exist.
+
+    expect: [(kind, {field: value, ...})] - every field must match one object.
+    Returns (verified: list, missing: list). The lesson behind it: a placement
+    once reported success on every API signal while nothing was drawn."""
+    doc, objs, err = await _sheet_state(kinds, timeout_seconds, document)
+    if err:
+        return [], [{"error": "read-back failed"}]
+    verified, missing = [], []
+    for kind, want in expect:
+        hit = any(o.get("kind") == kind and all(str(o.get(k)) == str(v) for k, v in want.items()) for o in objs)
+        (verified if hit else missing).append({"kind": kind, **want})
+    return verified, missing
+
+
+async def _apply_script(script, plan, warnings, doc, names, timeout_seconds, verify=None):
+    payload, images = await _run_sandbox(script, timeout_seconds)
+    if not payload.get("success"):
+        payload["warning"] = ("The script FAILED while modifying the sheet. A runtime "
+                              "failure leaves earlier changes applied - inspect the "
+                              "sheet before retrying.")
+        payload["plan"] = plan
+        return _sandbox_return(payload, images)
+    res = (payload.get("result") or "").strip()
+    if res.startswith("ABORT"):
+        return json.dumps({"success": False, "error": res}, indent=2)
+    parts = res.split("|")[1:]
+    counts = {n: (int(parts[i]) if i < len(parts) else None) for i, n in enumerate(names)}
+    out = {"success": True, "applied": True, "document": doc, **counts,
+           "plan": plan, "warnings": warnings,
+           "undo": "one Ctrl+Z in Altium reverts this whole call", "raw": res}
+    if verify:
+        expect, kinds, document = verify
+        verified, missing = await _verify_added(expect, kinds, document, timeout_seconds)
+        out["verified"] = len(verified)
+        if missing:
+            out["success"] = False
+            out["missing_after_apply"] = missing
+            out["error"] = "the script reported success but %d object(s) are not on the sheet" % len(missing)
+    return json.dumps(out, indent=2)
+
+
+@_tool()
+async def move_schematic_objects(ctx: Context, moves: list, apply: bool = False,
+                                 document: str = None, force: bool = False,
+                                 timeout_seconds: int = 180) -> str:
+    """
+    Move directives, ports, components, net labels or power ports on the
+    focused schematic sheet - the things a re-route leaves behind.
+
+    Re-routing a cluster one row up or down leaves every net-class directive,
+    test pad and MFG_TP directive sitting on the NEIGHBOUR'S wire, which
+    Altium accepts without a word. This moves them too.
+
+    DEFAULTS TO A PREVIEW (apply=False). One call = one undo step.
+    Coordinates are internal units (1 mil = 10000).
+
+    Args:
+        moves (list): each {"kind": paramset|port|component|netlabel|power|
+            noerc|junction, "match": {...}, "to": [x, y]} or {..., "by": [dx, dy]}.
+            match keys: name (paramset/port), text (netlabel/power),
+            designator / lib_reference (component), plus optional exact x, y.
+            Every matching object moves; a "to" move matching several objects
+            stacks them and is flagged in the preview.
+        apply (bool): False previews; True moves.
+        document (str): full path of the sheet to edit; it must be open but
+            need not be focused. Defaults to the focused sheet, which changes
+            under you - pass it.
+
+    Returns:
+        str: JSON with per-move match counts, warnings (a directive or a
+             component pin landing off every wire), and when applied the count.
+    """
+    moves = moves or []
+    if not moves:
+        return json.dumps({"success": False, "error": "nothing to do"})
+    for m in moves:
+        if ("to" not in m) == ("by" not in m):
+            return json.dumps({"success": False,
+                               "error": "each move needs exactly one of 'to' or 'by': %s" % (m,)})
+        if m.get("kind") not in _MATCH_FIELDS:
+            return json.dumps({"success": False, "error": "unknown kind in %s" % (m,)})
+    logger.info("move_schematic_objects: %d moves, apply=%s" % (len(moves), apply))
+
+    kinds = sorted({m["kind"] for m in moves} | {"wire", "pin"})
+    doc, objs, err = await _sheet_state(kinds, timeout_seconds, document)
+    if err:
+        return err
+    plan, warnings = _plan_matches(moves, objs, "move")
+    segs = _wire_segments(objs)
+    for m in moves:
+        for o in objs:
+            if not _object_matches(m["kind"], m.get("match", {}), o):
+                continue
+            if "to" in m:
+                dx, dy = int(m["to"][0]) - o["x"], int(m["to"][1]) - o["y"]
+            else:
+                dx, dy = int(m["by"][0]), int(m["by"][1])
+            if m["kind"] in ("paramset", "netlabel"):
+                p = (o["x"] + dx, o["y"] + dy)
+                if not any(_point_on_segment(p, a, b) for a, b in segs):
+                    warnings.append("%s %r would land at %s, which is on no wire"
+                                    % (m["kind"], o.get("name") or o.get("text"), p))
+            elif m["kind"] == "component":
+                for pin in objs:
+                    if pin.get("kind") == "pin" and pin.get("owner_designator") == o["designator"] \
+                            and pin.get("owner_lib_reference") == o["lib_reference"]:
+                        p = (pin["connect_x"] + dx, pin["connect_y"] + dy)
+                        if not any(_point_on_segment(p, a, b) for a, b in segs):
+                            warnings.append("component %s pin %s would end at %s, on no wire"
+                                            % (o["designator"], pin["designator"], p))
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc,
+                           "plan": plan, "warnings": warnings,
+                           "note": "preview only - call again with apply=true to move"},
+                          indent=2)
+    blocked = _blocking(warnings, ("which is on no wire", "on no wire"))
+    if blocked and not force:
+        return json.dumps({"success": False, "applied": False, "document": doc,
+                           "error": "refused: these moves would leave a directive or a pin off every wire "
+                                    "(pass force=true to move anyway)", "blocked": blocked,
+                           "warnings": warnings}, indent=2)
+    return await _apply_script(_target_document(_move_objects_script(moves), document),
+                               plan, warnings, doc, ["moved"], timeout_seconds)
+
+
+@_tool()
+async def set_parameter_sets(ctx: Context, add: list = None, rename: list = None,
+                             delete: list = None, apply: bool = False,
+                             document: str = None, force: bool = False,
+                             timeout_seconds: int = 180) -> str:
+    """
+    Create, rename and delete parameter-set DIRECTIVES on the focused sheet:
+    net-class marks, differential-pair marks, MFG_TP test-pad marks.
+
+    A directive is a parameter set whose visible Name is the label on the
+    sheet and whose HIDDEN parameters carry the meaning: a net-class directive
+    has ClassName=<pcb class>; a differential pair has DifferentialPair=True
+    and DifferentialPairClassName=<pair class>. House usage measured on the
+    X2/X9 comms sheets: one class directive per interface wire at the pin's
+    electrical point (Name MC_<interface>, orientation 1, colour 255), an
+    MFG_TP directive (colour 16711680) 100 mil from each test pad's pin.
+
+    DEFAULTS TO A PREVIEW (apply=False). One call = one undo step.
+    Coordinates are internal units (1 mil = 10000). A directive names a net
+    only if its location lies ON a wire; the preview flags misses.
+
+    Args:
+        add (list): [{"name": "MC_SPI6", "x":..., "y":..., "class_name": "MC_SPI6",
+            "orientation": 1, "color": 255, "style": 1}] or with "params":
+            {"DifferentialPair": "True", "DifferentialPairClassName": "USB"} -
+            every param is hidden. style 1 (default) draws the house circle
+            glyph only; style 0 also prints the Name, which collides with pin
+            text at a pin end - the house uses 0 only for pair/blanket marks.
+        rename (list): [{"match": {"name": "MC_I2C1", "y": 85000000},
+            "name": "MC_I2C2", "class_name": "MC_I2C2"}] - sets the visible
+            name and/or hidden params on every matching directive.
+        delete (list): [match, ...] with name and optional x, y.
+        apply (bool): False previews; True writes.
+        document (str): full path of the sheet to edit (open, not necessarily
+            focused). Defaults to the focused sheet - pass it.
+
+    Returns:
+        str: JSON with match counts, warnings and, when applied, counts.
+    """
+    add, rename, delete = add or [], rename or [], delete or []
+    if not add and not rename and not delete:
+        return json.dumps({"success": False, "error": "nothing to do"})
+    for a in add:
+        if not all(k in a for k in ("name", "x", "y")):
+            return json.dumps({"success": False, "error": "add entries need name, x, y: %s" % (a,)})
+        if not _paramset_params(a):
+            return json.dumps({"success": False,
+                               "error": "add %r has no class_name/params - a directive with no "
+                                        "hidden parameter means nothing" % a["name"]})
+    logger.info("set_parameter_sets: %d add, %d rename, %d delete, apply=%s"
+                % (len(add), len(rename), len(delete), apply))
+    doc, objs, err = await _sheet_state(["paramset", "wire"], timeout_seconds, document)
+    if err:
+        return err
+    plan, warnings = _plan_matches([dict(r, kind="paramset") for r in rename], objs, "rename")
+    p2, w2 = _plan_matches([{"kind": "paramset", "match": d} for d in delete], objs, "delete")
+    plan += p2; warnings += w2
+    segs = _wire_segments(objs)
+    for a in add:
+        p = (int(a["x"]), int(a["y"]))
+        if not any(_point_on_segment(p, s, e) for s, e in segs):
+            warnings.append("added directive %r at %s is on no wire - it marks nothing" % (a["name"], p))
+        if any(o["kind"] == "paramset" and (o["x"], o["y"]) == p for o in objs):
+            warnings.append("added directive %r lands on an existing directive at %s" % (a["name"], p))
+    plan.append({"adds": len(add)})
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc,
+                           "plan": plan, "warnings": warnings,
+                           "note": "preview only - call again with apply=true to write"}, indent=2)
+    blocked = _blocking(warnings, ("is on no wire",))
+    if blocked and not force:
+        return json.dumps({"success": False, "applied": False, "document": doc,
+                           "error": "refused: these directives would mark nothing (pass force=true to "
+                                    "place them anyway)", "blocked": blocked, "warnings": warnings}, indent=2)
+    expect = [("paramset", {"name": a["name"], "x": int(a["x"]), "y": int(a["y"])}) for a in add]
+    return await _apply_script(_target_document(_set_paramsets_script(add, rename, delete), document),
+                               plan, warnings, doc, ["renamed", "added", "deleted"], timeout_seconds,
+                               verify=(expect, ["paramset"], document) if expect else None)
+
+
+@_tool()
+async def set_schematic_ports(ctx: Context, add: list = None, rename: list = None,
+                              delete: list = None, apply: bool = False,
+                              document: str = None, timeout_seconds: int = 180) -> str:
+    """
+    Create, edit and delete PORTS on the focused schematic sheet.
+
+    In the house style a port is the harness hook for a cluster: Name is the
+    harness (UART7, SPI6, ...), HarnessType one of the types in the project's
+    .Harness file (UART, UART_FC, SPI, I2C, SMBUS, SDMMC, USB, CANTXRX, SWD,
+    ETH_RMII, PWMx4, ...), and it stands FREE at the sheet edge level with the
+    cluster's middle row - nets are global by name, the port matches a sheet
+    entry on the parent. Left ports at x=1800 mil, right ports right-aligned
+    to x=14000 mil, measured on the X9 comms sheet. A HarnessType missing from
+    the .Harness file compiles with a warning; add the type there.
+
+    DEFAULTS TO A PREVIEW (apply=False). One call = one undo step.
+    Coordinates are internal units (1 mil = 10000).
+
+    Args:
+        add (list): [{"name": "SPI6", "harness_type": "SPI", "x":..., "y":...,
+            "width": 4000000, "io_type": 0|1|2|3, "style", "alignment",
+            "color", "area_color", "text_color", "font_id"}] - defaults match
+            the house ports (height 100 mil, colours 128/8454143/128, font 1).
+        rename (list): [{"match": {"name": "UART5"}, "name": "USART3",
+            "harness_type": "UART_FC", "width": ...}] - any port member.
+        delete (list): [match, ...] with name and optional x, y.
+        apply (bool): False previews; True writes.
+        document (str): full path of the sheet to edit (open, not necessarily
+            focused). Defaults to the focused sheet - pass it.
+
+    Returns:
+        str: JSON with match counts, duplicate-name warnings and counts.
+    """
+    add, rename, delete = add or [], rename or [], delete or []
+    if not add and not rename and not delete:
+        return json.dumps({"success": False, "error": "nothing to do"})
+    for a in add:
+        if not all(k in a for k in ("name", "x", "y", "width")):
+            return json.dumps({"success": False, "error": "add entries need name, x, y, width: %s" % (a,)})
+    logger.info("set_schematic_ports: %d add, %d rename, %d delete, apply=%s"
+                % (len(add), len(rename), len(delete), apply))
+    doc, objs, err = await _sheet_state(["port"], timeout_seconds, document)
+    if err:
+        return err
+    plan, warnings = _plan_matches([dict(r, kind="port") for r in rename], objs, "rename")
+    p2, w2 = _plan_matches([{"kind": "port", "match": d} for d in delete], objs, "delete")
+    plan += p2; warnings += w2
+    names = [o["name"] for o in objs if o["kind"] == "port"]
+    for a in add:
+        if a["name"] in names:
+            warnings.append("a port named %r already exists on this sheet" % a["name"])
+    for r in rename:
+        if r.get("name") in names:
+            warnings.append("rename target %r already exists on this sheet" % r["name"])
+    plan.append({"adds": len(add)})
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc,
+                           "plan": plan, "warnings": warnings,
+                           "note": "preview only - call again with apply=true to write"}, indent=2)
+    expect = [("port", {"name": a["name"], "x": int(a["x"]), "y": int(a["y"])}) for a in add]
+    return await _apply_script(_target_document(_set_ports_script(add, rename, delete), document),
+                               plan, warnings, doc, ["renamed", "added", "deleted"], timeout_seconds,
+                               verify=(expect, ["port"], document) if expect else None)
+
+
+def _find_connector_pas(harness_type, top_y, var="Obj3"):
+    return ["%s := nil;" % var,
+            "Obj2 := Obj1.SchIterator_Create;",
+            "Obj2.AddFilter_ObjectSet(MkSet(eHarnessConnector));",
+            "Obj4 := Obj2.FirstSchObject;",
+            "while Obj4 <> nil do", "begin",
+            "  if (Obj4.HarnessType = %s) and (Obj4.Location.Y = %d) then %s := Obj4;"
+            % (_pas_str(harness_type), int(top_y), var),
+            "  Obj4 := Obj2.NextSchObject;", "end;",
+            "Obj1.SchIterator_Destroy(Obj2);",
+            "if %s = nil then begin ResultText := 'ABORT|connector %s@%d not found'; "
+            "Exit; end;"
+            % (var, harness_type.replace("'", ""), int(top_y))]
+
+
+def _find_signal_harness_pas(x1, y1, var="Obj3"):
+    return ["%s := nil;" % var,
+            "Obj2 := Obj1.SchIterator_Create;",
+            "Obj2.AddFilter_ObjectSet(MkSet(eSignalHarness));",
+            "Obj4 := Obj2.FirstSchObject;",
+            "while Obj4 <> nil do", "begin",
+            "  if (Obj4.Vertex[1].X = %d) and (Obj4.Vertex[1].Y = %d) then %s := Obj4;"
+            % (int(x1), int(y1), var),
+            "  Obj4 := Obj2.NextSchObject;", "end;",
+            "Obj1.SchIterator_Destroy(Obj2);",
+            "if %s = nil then begin ResultText := 'ABORT|signal harness @%d,%d not found'; "
+            "Exit; end;" % (var, int(x1), int(y1))]
+
+
+def _entry_edits_pas(var, renames=None, remove=None, add=None):
+    """Edit the entries of connector `var` (renames {old: new}; remove [names];
+    add [{"name", "distance_from_top", "side"}])."""
+    out = []
+    for old, new in (renames or {}).items():
+        out += ["Obj4 := %s.SchIterator_Create;" % var,
+                "Obj4.AddFilter_ObjectSet(MkSet(eHarnessEntry));",
+                "Obj2 := Obj4.FirstSchObject;",
+                "while Obj2 <> nil do", "begin",
+                "  if Obj2.Name = %s then" % _pas_str(old), "  begin"]
+        out += ["    " + x for x in _modify_block("Obj2", ["Obj2.Name := %s;" % _pas_str(new)])]
+        out += ["  end;", "  Obj2 := Obj4.NextSchObject;", "end;",
+                "%s.SchIterator_Destroy(Obj4);" % var]
+    for name in (remove or []):
+        out += ["Obj4 := %s.SchIterator_Create;" % var,
+                "Obj4.AddFilter_ObjectSet(MkSet(eHarnessEntry));",
+                "Obj2 := Obj4.FirstSchObject;",
+                "while (Obj2 <> nil) and (Obj2.Name <> %s) do Obj2 := Obj4.NextSchObject;" % _pas_str(name),
+                "%s.SchIterator_Destroy(Obj4);" % var,
+                "if Obj2 <> nil then", "begin",
+                "  %s.RemoveSchObject(Obj2);" % var,
+                "  SchServer.RobotManager.SendMessage(%s.I_ObjectAddress, c_BroadCast," % var,
+                "      SCHM_PrimitiveRegistration, Obj2.I_ObjectAddress);", "end;"]
+    for e in (add or []):
+        out += ["Obj2 := SchServer.SchObjectFactory(eHarnessEntry, eCreate_Default);",
+                "Obj2.Name := %s;" % _pas_str(e["name"]),
+                "Obj2.Side := %d;" % int(e.get("side", 1)),
+                "Obj2.DistanceFromTop := %d;" % int(e["distance_from_top"]),
+                "Obj2.Color := 7354880;", "Obj2.AreaColor := 8454143;",
+                "Obj2.TextColor := 7354880;", "Obj2.TextFontID := 1;",
+                "%s.AddSchObject(Obj2);" % var,
+                # Measured: an entry added this way keeps Location 0,0 (it is not
+                # drawn) until placed explicitly; re-setting DistanceFromTop does
+                # not help. Side 1 = right edge, 0 = left edge of the connector.
+                "Obj2.Location := Point(%s.Location.X%s, %s.Location.Y - %d);"
+                % (var, " + %s.XSize" % var if int(e.get("side", 1)) == 1 else "",
+                   var, int(e["distance_from_top"]))]
+    return out
+
+
+def _set_harness_connectors_script(add, move, delete):
+    """One undo step over harness assemblies (connector + signal harness).
+
+    add:    {"template": {"harness_type", "top_y", "harness_start": [x, y]},
+             "by": [dx, dy], "harness_type"?, "y_size"?, "primary_connection_position"?,
+             "entries"?: {"rename": {...}, "remove": [...], "add": [...]},
+             "harness_end"?: [x, y]  (re-seats the harness's FIRST vertex)}
+    move:   {"harness_type", "top_y", "harness_start": [x, y], "by": [dx, dy]}
+    delete: {"harness_type", "top_y", "harness_start": [x, y]}
+    """
+    lines = list(_SCRIPT_HEAD)
+    for a in add:
+        t = a["template"]
+        dx, dy = int(a["by"][0]), int(a["by"][1])
+        lines += _find_connector_pas(t["harness_type"], t["top_y"])
+        lines += ["Obj5 := Obj3.Replicate;", "Obj5.MoveByXY(%d, %d);" % (dx, dy)]
+        if a.get("harness_type"):
+            lines.append("Obj5.HarnessType := %s;" % _pas_str(a["harness_type"]))
+        if a.get("y_size") is not None:
+            lines.append("Obj5.YSize := %d;" % int(a["y_size"]))
+        if a.get("primary_connection_position") is not None:
+            lines.append("Obj5.PrimaryConnectionPosition := %d;" % int(a["primary_connection_position"]))
+        ent = a.get("entries") or {}
+        lines += _entry_edits_pas("Obj5", ent.get("rename"), ent.get("remove"), ent.get("add"))
+        lines += _register("Obj5") + ["I2 := I2 + 1;"]
+        if t.get("harness_start"):
+            hx, hy = t["harness_start"]
+            lines += _find_signal_harness_pas(hx, hy)
+            lines += ["Obj5 := Obj3.Replicate;", "Obj5.MoveByXY(%d, %d);" % (dx, dy)]
+            if a.get("harness_end"):
+                lines.append("Obj5.SetState_Vertex(1, Point(%d, %d));"
+                             % (int(a["harness_end"][0]), int(a["harness_end"][1])))
+            lines += _register("Obj5") + ["I2 := I2 + 1;"]
+    for m in move:
+        dx, dy = int(m["by"][0]), int(m["by"][1])
+        lines += _find_connector_pas(m["harness_type"], m["top_y"])
+        lines += _modify_block("Obj3", ["Obj3.MoveByXY(%d, %d);" % (dx, dy)]) + ["I1 := I1 + 1;"]
+        if m.get("harness_start"):
+            lines += _find_signal_harness_pas(*m["harness_start"])
+            lines += _modify_block("Obj3", ["Obj3.MoveByXY(%d, %d);" % (dx, dy)]) + ["I1 := I1 + 1;"]
+    for d in delete:
+        lines += _find_connector_pas(d["harness_type"], d["top_y"])
+        lines += ["Obj1.RemoveSchObject(Obj3);",
+                  "SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,",
+                  "    SCHM_PrimitiveRegistration, Obj3.I_ObjectAddress);", "I3 := I3 + 1;"]
+        if d.get("harness_start"):
+            lines += _find_signal_harness_pas(*d["harness_start"])
+            lines += ["Obj1.RemoveSchObject(Obj3);",
+                      "SchServer.RobotManager.SendMessage(Obj1.I_ObjectAddress, c_BroadCast,",
+                      "    SCHM_PrimitiveRegistration, Obj3.I_ObjectAddress);", "I3 := I3 + 1;"]
+    lines += _script_tail(["I1", "I2", "I3"])
+    return chr(10).join(lines)
+
+
+@_tool()
+async def set_harness_connectors(ctx: Context, add: list = None, move: list = None,
+                                 delete: list = None, apply: bool = False,
+                                 document: str = None, timeout_seconds: int = 180) -> str:
+    """
+    Add, move or delete harness ASSEMBLIES (a harness connector plus the
+    signal harness that runs from it to a port) on the focused sheet.
+
+    House pattern (measured on the X2/X9 comms sheets): each interface
+    cluster's wires end on the entries of a harness connector; the
+    connector's primary connection carries a signal harness to a harness
+    port at the sheet edge. A re-route that moves the wires must move the
+    connector and harness too, and a new cluster needs a new assembly.
+
+    New assemblies are made by REPLICATING an existing one of the same type
+    and side (left-side connectors have entries on their right edge, right-
+    side ones on their left; the API cannot flip a connector), moving it by
+    a delta, then editing it: harness_type, y_size, primary_connection_position
+    (all internal units), entries {"rename": {old: new}, "remove": [names],
+    "add": [{"name", "distance_from_top", "side"}]}, and harness_end to
+    re-seat the harness's first vertex on the port. Geometry: a connector's
+    x/y is its TOP-LEFT corner; an entry sits at y - distance_from_top; the
+    harness meets the connector at y - primary_connection_position.
+
+    DEFAULTS TO A PREVIEW (apply=False). One call = one undo step.
+    Coordinates are internal units (1 mil = 10000). Identify a connector by
+    harness_type + top_y (its Location.Y) and its harness by harness_start
+    (the harness's first vertex) - get both from get_schematic_objects with
+    kinds ["harness", "signalharness"].
+
+    Args:
+        add (list): [{"template": {"harness_type": "SPI", "top_y": 66000000,
+            "harness_start": [22000000, 64000000]}, "by": [0, -4000000],
+            "harness_type": "QSPI", "y_size": 7000000, "primary_connection_position":
+            4000000, "entries": {...}, "harness_end": [x, y]}]
+        move (list): [{"harness_type", "top_y", "harness_start", "by": [dx, dy]}]
+        delete (list): [{"harness_type", "top_y", "harness_start"}]
+        apply (bool): False previews; True writes.
+        document (str): full path of the sheet to edit (open, not necessarily
+            focused). Defaults to the focused sheet - pass it.
+
+    Returns:
+        str: JSON with what each template/move/delete matched, warnings, and
+             when applied the counts (moved, added, deleted).
+    """
+    add, move, delete = add or [], move or [], delete or []
+    if not add and not move and not delete:
+        return json.dumps({"success": False, "error": "nothing to do"})
+    for a in add:
+        t = a.get("template") or {}
+        if not all(k in t for k in ("harness_type", "top_y")) or "by" not in a:
+            return json.dumps({"success": False,
+                               "error": "add entries need template{harness_type, top_y} and by: %s" % (a,)})
+    for m in move:
+        if not all(k in m for k in ("harness_type", "top_y", "by")):
+            return json.dumps({"success": False, "error": "move entries need harness_type, top_y, by: %s" % (m,)})
+    logger.info("set_harness_connectors: %d add, %d move, %d delete, apply=%s"
+                % (len(add), len(move), len(delete), apply))
+    doc, objs, err = await _sheet_state(["harness", "signalharness", "wire"], timeout_seconds, document)
+    if err:
+        return err
+    conns = [o for o in objs if o["kind"] == "harness"]
+    harns = [o for o in objs if o["kind"] == "signalharness"]
+    segs = _wire_segments(objs)
+
+    def find_conn(ht, top):
+        return [c for c in conns if c["harness_type"] == ht and c["y"] == int(top)]
+
+    def find_harn(start):
+        return [h for h in harns if start and (h.get("x"), h.get("y")) == (int(start[0]), int(start[1]))]
+
+    plan, warnings = [], []
+    for label, items in (("add", add), ("move", move), ("delete", delete)):
+        for it in items:
+            ref = it.get("template", it) if label == "add" else it
+            c = find_conn(ref["harness_type"], ref["top_y"])
+            h = find_harn(ref.get("harness_start"))
+            plan.append({label: it, "connector_matches": len(c), "harness_matches": len(h)})
+            if len(c) != 1:
+                warnings.append("%s: connector %s@%s matches %d (need exactly 1)"
+                                % (label, ref["harness_type"], ref["top_y"], len(c)))
+            if ref.get("harness_start") and len(h) != 1:
+                warnings.append("%s: signal harness starting at %s matches %d"
+                                % (label, ref["harness_start"], len(h)))
+            if label in ("add", "move") and len(c) == 1:
+                dx, dy = int(it["by"][0]), int(it["by"][1])
+                for e in c[0]["entries"]:
+                    p = (e["x"] + dx, e["y"] + dy)
+                    if not any(_point_on_segment(p, s, t) for s, t in segs):
+                        warnings.append("%s: entry %r would sit at %s, on no wire end"
+                                        % (label, e["name"], p))
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc,
+                           "plan": plan, "warnings": warnings,
+                           "note": "preview only - call again with apply=true to write"}, indent=2)
+    return await _apply_script(_target_document(_set_harness_connectors_script(add, move, delete), document),
+                               plan, warnings, doc, ["moved", "added", "deleted"], timeout_seconds)
+
+
+@_tool(read_only=True)
+async def check_sheet_conventions(ctx: Context, document: str = None, harness_dir: str = None,
+                                  label_pattern: str = None, dump_json: str = None,
+                                  timeout_seconds: int = 180) -> str:
+    """
+    Lint a schematic sheet against the house cluster anatomy and report a
+    pass/fail table instead of leaving it to eyesight.
+
+    Rules (see server/sheetlint.py and dev/SCHEMATIC_CONVENTIONS.md s.13):
+    pins with no wire, wire nets with no label, floating labels and
+    directives, interface nets without a directive, class conflicts, MFG pads
+    without an MFG_TP mark, harness entries off their wires, dangling signal
+    harnesses, ports off their harness or wire, harness types and entry names
+    not in the project's .Harness files, blanket directives and what they
+    cover, duplicate port names, unannotated designators.
+
+    Run it after every edit batch. Errors are wrong; warnings are worth a look;
+    infos describe what is there.
+
+    Args:
+        document (str): full path of the sheet (open, not necessarily focused).
+        harness_dir (str): folder holding the project's .Harness files; defaults
+            to the sheet's folder.
+        label_pattern (str): regex every net label must match, e.g.
+            "^MC_(P[A-K]\\d{1,2}_\\S+|OTGFS__[NP])$".
+        dump_json (str): path of a saved get_schematic_objects dump to lint
+            offline instead of reading the live sheet.
+
+    Returns:
+        str: JSON with summary, findings (severity, rule, message, x, y),
+             per-net rows, clusters and single nets, plus a text report.
+    """
+    import sheetlint
+    if dump_json:
+        data = json.loads(Path(dump_json).read_text(encoding="utf-8"))
+        doc = data.get("document", {"name": dump_json})
+        objs = data.get("objects", data)
+    else:
+        doc, objs, err = await _sheet_state(list(_SCH_KINDS), timeout_seconds, document)
+        if err:
+            return err
+    folder = harness_dir or str(Path(doc.get("name", document or ".")).parent)
+    types = {}
+    try:
+        for f in sorted(Path(folder).glob("*.Harness")):
+            types.update(sheetlint.parse_harness_file(f.read_text(encoding="utf-8", errors="replace")))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("harness files: %s" % e)
+    res = sheetlint.lint(objs, types or None, label_pattern)
+    res["document"] = doc
+    res["harness_types_known"] = sorted(types)
+    res["report"] = sheetlint.format_report(res)
+    return json.dumps(res, indent=2)
+
+
+@_tool()
+async def copy_schematic_area(ctx: Context, area: list, by: list, renames: dict = None,
+                              kinds: list = None, exclude_lib_references: list = None,
+                              apply: bool = False, document: str = None,
+                              timeout_seconds: int = 240) -> str:
+    """
+    Clone everything inside a rectangle to a new place - the way to make a new
+    cluster "look like that one".
+
+    Every object whose anchor (or every vertex, for wires and harnesses) lies
+    inside `area` is replicated with its children, shifted by `by`, and
+    registered; then `renames` {old: new} is applied to every text field of
+    the copies: net label text, port name, directive name and ClassName,
+    harness type and entry names, component designator. A cluster copied
+    this way keeps wires, labels, class marks, pads, marks, connector,
+    harness and port together and consistent.
+
+    Exclude the main part with exclude_lib_references (its pins define the
+    rows; you do not want a second MCU). Wires that only partly enter the
+    area are NOT copied - the preview lists them.
+
+    DEFAULTS TO A PREVIEW (apply=False). One call = one undo step.
+    Coordinates are internal units (1 mil = 10000).
+
+    Args:
+        area (list): [x0, y0, x1, y1].
+        by (list): [dx, dy] shift for the copies.
+        renames (dict): {"MC_SPI5": "MC_SPI6", "SPI5": "SPI6", "MC_PK0_SPI5_SCK__MEI": "MC_PA5_SPI6_SCK", ...}
+        kinds (list): subset of wire, netlabel, paramset, port, harness,
+            signalharness, component, power, noerc, junction (default all).
+        exclude_lib_references (list): components never copied (e.g. the MCU).
+        apply (bool): False previews; True copies.
+        document (str): sheet path (open, not necessarily focused).
+
+    Returns:
+        str: JSON with what would be copied per kind, partial wires skipped,
+             rename hits, and when applied the counts and read-back verification.
+    """
+    kinds = [str(k) for k in (kinds or _AREA_KINDS)]
+    bad = [k for k in kinds if k not in _AREA_CONSTS]
+    if bad:
+        return json.dumps({"success": False, "error": "unknown kinds %s" % bad})
+    if not area or len(area) != 4 or not by or len(by) != 2:
+        return json.dumps({"success": False, "error": "area needs [x0,y0,x1,y1] and by needs [dx,dy]"})
+    renames = {str(k): str(v) for k, v in (renames or {}).items()}
+    doc, objs, err = await _sheet_state(list(set(kinds) | {"wire", "pin"}), timeout_seconds, document)
+    if err:
+        return err
+    excl = set(exclude_lib_references or [])
+    inside = [o for o in objs if o.get("kind") in kinds and _obj_inside(o, area)
+              and not (o.get("kind") == "component" and o.get("lib_reference") in excl)]
+    partial = [o for o in objs if o.get("kind") in ("wire", "signalharness") and o.get("kind") in kinds
+               and not _obj_inside(o, area) and any(_in_rect(v["x"], v["y"], area) for v in o.get("vertices", []))]
+    texts = set()
+    for o in inside:
+        for key in ("text", "name", "harness_type", "designator"):
+            if o.get(key):
+                texts.add(str(o[key]))
+        for p in o.get("params", []):
+            texts.add(str(p.get("text")))
+        for e in o.get("entries", []):
+            texts.add(str(e.get("name")))
+    rename_hits = {k: v for k, v in renames.items() if k in texts}
+    rename_miss = sorted(set(renames) - set(rename_hits))
+    per_kind = {}
+    for o in inside:
+        per_kind[o["kind"]] = per_kind.get(o["kind"], 0) + 1
+    warnings = []
+    if partial:
+        warnings.append("%d wire/harness object(s) cross the area boundary and will NOT be copied" % len(partial))
+    if rename_miss:
+        warnings.append("rename keys matching nothing inside the area: %s" % rename_miss)
+    if not inside:
+        warnings.append("nothing inside the area")
+    plan = {"copies": per_kind, "partial_skipped": len(partial), "renames_applied": rename_hits}
+    if not apply or not inside:
+        return json.dumps({"success": True, "applied": False, "document": doc, "plan": plan,
+                           "warnings": warnings, "note": "preview only - call again with apply=true"}, indent=2)
+    dx, dy = int(by[0]), int(by[1])
+    expect = []
+    for o in inside:
+        if o["kind"] == "netlabel":
+            expect.append(("netlabel", {"text": renames.get(o["text"], o["text"]), "x": o["x"] + dx, "y": o["y"] + dy}))
+        elif o["kind"] == "port":
+            expect.append(("port", {"name": renames.get(o["name"], o["name"]), "x": o["x"] + dx, "y": o["y"] + dy}))
+        elif o["kind"] == "paramset":
+            expect.append(("paramset", {"name": renames.get(o["name"], o["name"]), "x": o["x"] + dx, "y": o["y"] + dy}))
+    script = _target_document(_area_script(area, dx, dy, "copy", kinds, exclude_lib_references, renames), document)
+    return await _apply_script(script, plan, warnings, doc, ["moved", "copied", "matched"], timeout_seconds,
+                               verify=(expect, ["netlabel", "port", "paramset"], document) if expect else None)
+
+
+@_tool()
+async def move_schematic_area(ctx: Context, area: list, by: list, kinds: list = None,
+                              exclude_lib_references: list = None, apply: bool = False,
+                              document: str = None, timeout_seconds: int = 240) -> str:
+    """
+    Shift everything inside a rectangle by a delta - a whole cluster in one
+    call: wires, labels, class marks, pads and their marks, harness connector,
+    signal harness and port move together, so nothing is left on the
+    neighbour's row.
+
+    Exclude the main part with exclude_lib_references (its pins define the
+    rows). Wires that only partly enter the area are NOT moved and are listed
+    in the preview; shrink or grow the area until it cuts nothing.
+
+    DEFAULTS TO A PREVIEW (apply=False). One call = one undo step.
+    Coordinates are internal units (1 mil = 10000).
+
+    Args:
+        area (list): [x0, y0, x1, y1].
+        by (list): [dx, dy].
+        kinds (list): subset of wire, netlabel, paramset, port, harness,
+            signalharness, component, power, noerc, junction (default all).
+        exclude_lib_references (list): components never moved (e.g. the MCU).
+        apply (bool): False previews; True moves.
+        document (str): sheet path (open, not necessarily focused).
+
+    Returns:
+        str: JSON with counts per kind, boundary-crossing objects, and when
+             applied the moved count.
+    """
+    kinds = [str(k) for k in (kinds or _AREA_KINDS)]
+    bad = [k for k in kinds if k not in _AREA_CONSTS]
+    if bad:
+        return json.dumps({"success": False, "error": "unknown kinds %s" % bad})
+    if not area or len(area) != 4 or not by or len(by) != 2:
+        return json.dumps({"success": False, "error": "area needs [x0,y0,x1,y1] and by needs [dx,dy]"})
+    doc, objs, err = await _sheet_state(list(set(kinds) | {"wire"}), timeout_seconds, document)
+    if err:
+        return err
+    excl = set(exclude_lib_references or [])
+    inside = [o for o in objs if o.get("kind") in kinds and _obj_inside(o, area)
+              and not (o.get("kind") == "component" and o.get("lib_reference") in excl)]
+    partial = [o for o in objs if o.get("kind") in ("wire", "signalharness") and o.get("kind") in kinds
+               and not _obj_inside(o, area) and any(_in_rect(v["x"], v["y"], area) for v in o.get("vertices", []))]
+    per_kind = {}
+    for o in inside:
+        per_kind[o["kind"]] = per_kind.get(o["kind"], 0) + 1
+    warnings = []
+    if partial:
+        warnings.append("%d wire/harness object(s) cross the area boundary and will NOT move: %s"
+                        % (len(partial), [[(v["x"], v["y"]) for v in p["vertices"]] for p in partial[:6]]))
+    if not inside:
+        warnings.append("nothing inside the area")
+    plan = {"moves": per_kind, "partial_skipped": len(partial)}
+    if not apply or not inside:
+        return json.dumps({"success": True, "applied": False, "document": doc, "plan": plan,
+                           "warnings": warnings, "note": "preview only - call again with apply=true"}, indent=2)
+    script = _target_document(_area_script(area, int(by[0]), int(by[1]), "move", kinds, exclude_lib_references), document)
+    return await _apply_script(script, plan, warnings, doc, ["moved", "copied", "matched"], timeout_seconds)
+
+
+@_tool()
+async def copy_component(ctx: Context, designator: str, to: list, new_designator: str = None,
+                         lib_reference: str = None, apply: bool = False, document: str = None,
+                         timeout_seconds: int = 180) -> str:
+    """
+    Place another instance of a component that is already on the sheet
+    (a test pad, a pull-up) by replicating it and moving the copy.
+
+    Placing from a library is broken (the replica does not draw and its pins
+    keep library coordinates); a copy of an on-sheet component keeps
+    absolute pin coordinates and draws. Verified on the X9 comms sheet.
+
+    DEFAULTS TO A PREVIEW (apply=False). Coordinates are internal units.
+
+    Args:
+        designator (str): the source component's designator (e.g. "BOT54"; "BOT?" also works,
+            first match is used).
+        to (list): [x, y] for the copy's Location - for a test pad that is its pin's
+            electrical point.
+        new_designator (str): designator text for the copy (e.g. "BOT?").
+        lib_reference (str): disambiguate when several components share the designator.
+        apply (bool): False previews; True places.
+        document (str): sheet path (open, not necessarily focused).
+
+    Returns:
+        str: JSON with the source found, its pins' new electrical points and
+             whether each lands on a wire, and when applied the read-back.
+    """
+    if not to or len(to) != 2:
+        return json.dumps({"success": False, "error": "to needs [x, y]"})
+    doc, objs, err = await _sheet_state(["component", "pin", "wire"], timeout_seconds, document)
+    if err:
+        return err
+    src = [o for o in objs if o.get("kind") == "component" and o.get("designator") == designator
+           and (not lib_reference or o.get("lib_reference") == lib_reference)]
+    if not src:
+        return json.dumps({"success": False, "error": "no component %r on this sheet" % designator})
+    c = src[0]
+    dx, dy = int(to[0]) - c["x"], int(to[1]) - c["y"]
+    segs = _wire_segments(objs)
+    pins = []
+    for p in objs:
+        if p.get("kind") == "pin" and p.get("owner_designator") == c["designator"] \
+                and p.get("owner_lib_reference") == c["lib_reference"]:
+            pt = (p["connect_x"] + dx, p["connect_y"] + dy)
+            pins.append({"pin": p["designator"], "x": pt[0], "y": pt[1],
+                         "on_wire": any(_point_on_segment(pt, a, b) for a, b in segs)})
+    warnings = [] if all(p["on_wire"] for p in pins) else ["a copied pin would land on no wire: %s" % [p for p in pins if not p["on_wire"]]]
+    plan = {"source": c, "copy_pins": pins, "new_designator": new_designator or c["designator"]}
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc, "plan": plan,
+                           "warnings": warnings, "note": "preview only - call again with apply=true"}, indent=2)
+    script = _target_document(_copy_component_script(designator, c["lib_reference"], int(to[0]), int(to[1]), new_designator), document)
+    expect = [("component", {"lib_reference": c["lib_reference"], "x": int(to[0]), "y": int(to[1])})]
+    return await _apply_script(script, plan, warnings, doc, ["moved", "copied", "matched"], timeout_seconds,
+                               verify=(expect, ["component"], document))
+
+
+@_tool(read_only=True)
+async def get_project_facts(ctx: Context, project: str) -> str:
+    """
+    Facts about an Altium project read OFFLINE from its files - no Altium
+    interaction, safe at any time: net-identifier options, the document
+    list, every harness type and its signals from the project's .Harness
+    files, and per-sheet counts of unannotated designators.
+
+    Args:
+        project (str): full path of the .PrjPcb, or of any sheet in the
+            project folder.
+
+    Returns:
+        str: JSON with options, documents, harness_types, sheets.
+    """
+    import sys as _sys
+    root = Path(_canon(project))
+    if root.suffix.lower() != ".prjpcb":
+        cands = sorted(root.parent.glob("*.PrjPcb"))
+        if not cands:
+            return json.dumps({"success": False, "error": "no .PrjPcb next to %s" % root})
+        root = cands[0]
+    folder = root.parent
+    text = root.read_text(encoding="utf-8", errors="replace")
+    options, docs = {}, []
+    for line in text.splitlines():
+        if "=" in line and not line.startswith("["):
+            k, _, v = line.partition("=")
+            if k in ("AllowPortNetNames", "AllowSheetEntryNetNames", "NetlistSingleSheet", "AppendSheetNumberToLocalNets",
+                     "NetIdentifierScope", "AutoNetIdentifierScope", "AllowPinSwapping_ByPin", "AllowPinSwapping_ByPart"):
+                options[k] = v
+            if k == "DocumentPath":
+                docs.append(v)
+    harness_types = {}
+    for f in sorted(folder.glob("*.Harness")):
+        try:
+            import sheetlint
+            for t, sigs in sheetlint.parse_harness_file(f.read_text(encoding="utf-8", errors="replace")).items():
+                harness_types.setdefault(t, {"signals": sigs, "files": []})["files"].append(f.name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("harness file %s: %s" % (f, e))
+    sheets = []
+    try:
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from pinout.schdoc import read_records
+        for d in docs:
+            if d.lower().endswith(".schdoc"):
+                p = folder / d
+                if not p.exists():
+                    sheets.append({"sheet": d, "missing": True})
+                    continue
+                recs = read_records(p)
+                comps = [r for r in recs if r.get("RECORD") == "1"]
+                desigs = [r.get("Text", "") for r in recs if r.get("RECORD") == "34"]
+                sheets.append({"sheet": d, "components": len(comps),
+                               "unannotated": sum("?" in t for t in desigs),
+                               "ports": sum(r.get("RECORD") == "18" for r in recs),
+                               "harness_connectors": sum(r.get("RECORD") == "215" for r in recs),
+                               "directives": sum(r.get("RECORD") == "43" for r in recs)})
+    except Exception as e:  # noqa: BLE001
+        sheets.append({"error": str(e)[:200]})
+    return json.dumps({"success": True, "project": str(root), "options": options,
+                       "nets_are_global": options.get("AllowPortNetNames") == "0",
+                       "documents": docs, "harness_types": harness_types, "sheets": sheets}, indent=2)
+
+
+_ERC_PAS = """Obj3 := Client.GetDocumentByPath(__DOC__);
+if Obj3 = nil then begin ResultText := 'ABORT|document not open'; Exit; end;
+Client.ShowDocument(Obj3);
+Sleep(600);
+SandboxLog('running Electrical Rules Check report');
+ResetParameters;
+AddStringParameter('ObjectKind', 'Validation');
+AddStringParameter('Kind', 'Electrical Rules Check');
+AddStringParameter('DisableDialog', 'True');
+AddStringParameter('Target', 'Document');
+AddStringParameter('ReturnGeneratedDocuments', 'True');
+RunProcess('WorkspaceManager:GenerateReport');
+I1 := -1;
+GetIntegerParameter('Result', I1);
+S1 := '';
+GetStringParameter('File1', S1);
+ResultText := 'OK|' + IntToStr(I1) + '|' + S1;"""
+
+
+def _erc_watchdog(stop_event, clicked, seconds=180):
+    """Press OK on the ERC setup form when it appears (it ignores DisableDialog).
+
+    The form's buttons are TXPBitBtn controls that ignore BM_CLICK; mouse
+    button messages posted at the button's centre work (measured)."""
+    import ctypes
+    import ctypes.wintypes as wt
+    user32 = ctypes.windll.user32
+
+    def text(h):
+        b = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(h, b, 256)
+        return b.value
+
+    def klass(h):
+        b = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(h, b, 256)
+        return b.value
+
+    def children(h):
+        out = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+        def cb(ch, _):
+            out.append(ch)
+            return True
+        user32.EnumChildWindows(h, cb, 0)
+        return out
+
+    def tops():
+        out = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+        def cb(h, _):
+            out.append(h)
+            return True
+        user32.EnumWindows(cb, 0)
+        return out
+
+    start = time.time()
+    while not stop_event.is_set() and time.time() - start < seconds:
+        for h in tops():
+            if klass(h) != "TERCReportSetup_Form":
+                continue
+            ok = [c for c in children(h) if text(c).replace("&", "") == "OK"]
+            if ok:
+                r = wt.RECT()
+                user32.GetWindowRect(ok[0], ctypes.byref(r))
+                lp = (((r.bottom - r.top) // 2) << 16) | ((r.right - r.left) // 2)
+                user32.PostMessageW(ok[0], 0x0201, 1, lp)
+                time.sleep(0.15)
+                user32.PostMessageW(ok[0], 0x0202, 0, lp)
+                clicked.append(time.time())
+                time.sleep(2.0)
+        time.sleep(0.5)
+
+
+def _parse_erc_html(text):
+    """Rows of (class, document, message) from Altium's ERC report HTML."""
+    import html as _html
+    body = re.sub(r"<script.*?</script>|<style.*?</style>", "", text, flags=re.S | re.I)
+    cells = [_html.unescape(re.sub(r"<[^>]+>", "", c)).strip()
+             for c in re.findall(r"<td[^>]*>(.*?)</td>", body, flags=re.S | re.I)]
+    rows, i = [], 0
+    while i + 2 < len(cells):
+        cls_ = cells[i]
+        if cls_ in ("Fatal Error", "Error", "Warning", "Info"):
+            rows.append({"class": cls_, "document": cells[i + 1], "message": cells[i + 2]})
+            i += 3
+        else:
+            i += 1
+    return rows
+
+
+@_tool(read_only=True)
+async def check_erc(ctx: Context, document: str, sheet: str = None, include_warnings: bool = True,
+                    max_rows: int = 400, timeout_seconds: int = 240) -> str:
+    """
+    Run Altium's Electrical Rules Check on the project that owns `document`
+    and return its findings - Altium's own compile messages, not geometry.
+
+    This generates the ERC report (WorkspaceManager:GenerateReport, Validation /
+    Electrical Rules Check) into the project's output folder and parses it.
+    Altium insists on showing the report's setup form; this tool presses its
+    OK for you. It SHOWS the sheet first (unavoidable) and leaves the report
+    document open in Altium.
+
+    Args:
+        document (str): full path of any sheet in the project (open).
+        sheet (str): only rows whose Document matches this file name.
+        include_warnings (bool): False returns errors and fatals only.
+        max_rows (int): cap on returned rows.
+
+    Returns:
+        str: JSON with the report path, counts by class, and rows
+             [{class, document, message}].
+    """
+    import threading
+    doc = _canon(document)
+    stop, clicked = threading.Event(), []
+    t = threading.Thread(target=_erc_watchdog, args=(stop, clicked, timeout_seconds), daemon=True)
+    t.start()
+    started = time.time()
+    try:
+        payload, images = await _run_sandbox(_ERC_PAS.replace("__DOC__", _pas_str(doc)), timeout_seconds)
+    finally:
+        stop.set()
+    if not payload.get("success"):
+        payload["note"] = "the ERC setup form was %s" % ("pressed" if clicked else "never seen")
+        return _sandbox_return(payload, images)
+    res = (payload.get("result") or "").split("|")
+    report = res[2] if len(res) > 2 and res[2] else None
+    if not report:
+        # Altium names the report after the shown sheet; find the newest html in the outputs folder
+        folder = Path(doc).parent
+        cands = [p for p in folder.glob("Project Outputs*/*.html") if p.stat().st_mtime >= started - 5]
+        report = str(max(cands, key=lambda p: p.stat().st_mtime)) if cands else None
+    if not report or not Path(report).exists():
+        return json.dumps({"success": False, "error": "ERC report not found after the run",
+                           "setup_form_pressed": bool(clicked), "raw": payload.get("result")}, indent=2)
+    rows = _parse_erc_html(Path(report).read_text(encoding="utf-8", errors="replace"))
+    if sheet:
+        key = Path(str(sheet)).name.lower()
+        rows = [r for r in rows if r["document"].lower() == key]
+    if not include_warnings:
+        rows = [r for r in rows if r["class"] in ("Fatal Error", "Error")]
+    counts = {}
+    for r in rows:
+        counts[r["class"]] = counts.get(r["class"], 0) + 1
+    return json.dumps({"success": True, "report": report, "counts": counts, "rows_returned": min(len(rows), max_rows),
+                       "rows_total": len(rows), "rows": rows[:max_rows],
+                       "setup_form_pressed": bool(clicked)}, indent=2)
+
+
+def _find_sheet_symbol_pas(name, var="Obj3"):
+    """Leave the sheet symbol whose SheetName or SheetFileName matches in `var`."""
+    return ["%s := nil;" % var,
+            "Obj2 := Obj1.SchIterator_Create;",
+            "Obj2.AddFilter_ObjectSet(MkSet(eSheetSymbol));",
+            "Obj6 := Obj2.FirstSchObject;",
+            "while Obj6 <> nil do", "begin",
+            "  if (Obj6.SheetName.Text = %s) or (Obj6.SheetFileName.Text = %s) then %s := Obj6;"
+            % (_pas_str(name), _pas_str(name), var),
+            "  Obj6 := Obj2.NextSchObject;", "end;",
+            "Obj1.SchIterator_Destroy(Obj2);",
+            "if %s = nil then begin ResultText := 'ABORT|sheet symbol %s not found'; "
+            "Exit; end;"
+            % (var, str(name).replace("'", ""))]
+
+
+def _set_sheet_entries_script(symbol, add, rename, delete):
+    """One undo step adding / editing / removing entries on one sheet symbol.
+
+    add:    {"name", "distance_from_top", "side"=1, "io_type"=0, "harness_type"=""}
+    rename: {"match": {"name": old}, "name"?, "harness_type"?, "io_type"?,
+             "distance_from_top"?, "side"?}
+    delete: [name, ...]
+    """
+    lines = list(_SCRIPT_HEAD)
+    lines += _find_sheet_symbol_pas(symbol, "Obj9")
+    for r in rename:
+        want = (r.get("match") or {}).get("name")
+        sets = []
+        for key, member, typ in (("name", "Name", str), ("harness_type", "HarnessType", str),
+                                 ("io_type", "IOType", int), ("side", "Side", int),
+                                 ("distance_from_top", "DistanceFromTop", int)):
+            if r.get(key) is not None:
+                val = _pas_str(r[key]) if typ is str else str(int(r[key]))
+                sets.append("Obj7.%s := %s;" % (member, val))
+        lines += ["Obj4 := Obj9.SchIterator_Create;",
+                  "Obj4.AddFilter_ObjectSet(MkSet(eSheetEntry));",
+                  "Obj7 := Obj4.FirstSchObject;",
+                  "while Obj7 <> nil do", "begin",
+                  "  if Obj7.Name = %s then" % _pas_str(want), "  begin"]
+        lines += ["    " + x for x in _modify_block("Obj7", sets)]
+        lines += ["    I1 := I1 + 1;", "  end;",
+                  "  Obj7 := Obj4.NextSchObject;", "end;",
+                  "Obj9.SchIterator_Destroy(Obj4);"]
+    for name in delete:
+        lines += ["Obj7 := nil;",
+                  "Obj4 := Obj9.SchIterator_Create;",
+                  "Obj4.AddFilter_ObjectSet(MkSet(eSheetEntry));",
+                  "Obj8 := Obj4.FirstSchObject;",
+                  "while (Obj8 <> nil) and (Obj7 = nil) do", "begin",
+                  "  if Obj8.Name = %s then Obj7 := Obj8;" % _pas_str(name),
+                  "  Obj8 := Obj4.NextSchObject;", "end;",
+                  "Obj9.SchIterator_Destroy(Obj4);",
+                  "if Obj7 <> nil then", "begin",
+                  "  Obj9.RemoveSchObject(Obj7);",
+                  "  SchServer.RobotManager.SendMessage(Obj9.I_ObjectAddress, c_BroadCast,",
+                  "      SCHM_PrimitiveRegistration, Obj7.I_ObjectAddress);",
+                  "  I3 := I3 + 1;", "end;"]
+    for a in add:
+        side = int(a.get("side", 1))
+        lines += ["Obj7 := SchServer.SchObjectFactory(eSheetEntry, eCreate_Default);",
+                  "Obj7.Name := %s;" % _pas_str(a["name"]),
+                  "Obj7.Side := %d;" % side,
+                  "Obj7.DistanceFromTop := %d;" % int(a["distance_from_top"]),
+                  "Obj7.IOType := %d;" % int(a.get("io_type", 0)),
+                  "Obj7.Style := %d;" % int(a.get("style", 0)),
+                  "Obj7.ArrowKind := %d;" % int(a.get("arrow_kind", 0)),
+                  "Obj7.Color := 7354880;", "Obj7.AreaColor := 8454143;",
+                  "Obj7.TextColor := 7354880;", "Obj7.TextFontID := 1;"]
+        if a.get("harness_type"):
+            lines.append("Obj7.HarnessType := %s;" % _pas_str(a["harness_type"]))
+        lines += ["Obj9.AddSchObject(Obj7);",
+                  "SchServer.RobotManager.SendMessage(Obj9.I_ObjectAddress, c_BroadCast,",
+                  "    SCHM_PrimitiveRegistration, Obj7.I_ObjectAddress);",
+                  # Same trap as harness entries: a factory child reports 0,0 until placed.
+                  "Obj7.Location := Point(Obj9.Location.X%s, Obj9.Location.Y - %d);"
+                  % (" + Obj9.XSize" if side == 1 else "", int(a["distance_from_top"])),
+                  "I2 := I2 + 1;"]
+    lines += _script_tail(["I1", "I2", "I3"])
+    return chr(10).join(lines)
+
+
+# Emits the parent's sheet symbols with their entries, then each child sheet's
+# ports. One dispatch for the whole hierarchy; a compiled project has every
+# sheet in memory, so no tabs are opened.
+_HIERARCHY_PAS = """Obj1 := SchServer.GetSchDocumentByPath(__DOC__);
+if Obj1 = nil then begin ResultText := 'ABORT|parent sheet not in memory - compile the project first'; Exit; end;
+List1 := TStringList.Create;
+List1.Add('parent|' + Obj1.DocumentName);
+S7 := ExtractFilePath(Obj1.DocumentName);
+Obj2 := Obj1.SchIterator_Create;
+Obj2.AddFilter_ObjectSet(MkSet(eSheetSymbol));
+Obj3 := Obj2.FirstSchObject;
+while Obj3 <> nil do
+begin
+  S3 := 'symbol|' + Obj3.SheetName.Text + '|' + Obj3.SheetFileName.Text;
+  Obj4 := Obj3.SchIterator_Create;
+  try
+    Obj4.AddFilter_ObjectSet(MkSet(eSheetEntry));
+    Obj5 := Obj4.FirstSchObject;
+    while Obj5 <> nil do
+    begin
+      S3 := S3 + '|' + Obj5.Name + ',' + IntToStr(Obj5.Side) + ',' +
+            IntToStr(Obj5.DistanceFromTop) + ',' + IntToStr(Obj5.IOType) + ',' + Obj5.HarnessType;
+      Obj5 := Obj4.NextSchObject;
+    end;
+  finally
+    Obj3.SchIterator_Destroy(Obj4);
+  end;
+  List1.Add(S3);
+  List3.Add(Obj3.SheetFileName.Text);
+  Obj3 := Obj2.NextSchObject;
+end;
+Obj1.SchIterator_Destroy(Obj2);
+for I1 := 0 to List3.Count - 1 do
+begin
+  S1 := List3[I1];
+  Obj6 := SchServer.GetSchDocumentByPath(S7 + S1);
+  if Obj6 = nil then
+    List1.Add('childmissing|' + S1)
+  else
+  begin
+    S3 := 'childports|' + S1;
+    Obj2 := Obj6.SchIterator_Create;
+    try
+      Obj2.AddFilter_ObjectSet(MkSet(ePort));
+      Obj3 := Obj2.FirstSchObject;
+      while Obj3 <> nil do
+      begin
+        S3 := S3 + '|' + Obj3.Name + ',' + Obj3.HarnessType;
+        Obj3 := Obj2.NextSchObject;
+      end;
+    finally
+      Obj6.SchIterator_Destroy(Obj2);
+    end;
+    List1.Add(S3);
+  end;
+end;
+ResultText := List1.Text;"""
+
+
+def _parse_hierarchy(text):
+    parent, symbols, child_ports, missing = None, [], {}, []
+    for line in (text or "").splitlines():
+        f = line.split("|")
+        if f[0] == "parent":
+            parent = f[1]
+        elif f[0] == "symbol":
+            entries = []
+            for e in f[3:]:
+                if not e:
+                    continue
+                name, side, dft, io, htype = e.rsplit(",", 4)
+                entries.append({"name": name, "side": int(side), "distance_from_top": int(dft),
+                                "io_type": int(io), "harness_type": htype})
+            symbols.append({"sheet_name": f[1], "file_name": f[2], "entries": entries})
+        elif f[0] == "childports":
+            ports = []
+            for p in f[2:]:
+                if not p:
+                    continue
+                name, _, htype = p.rpartition(",")
+                ports.append({"name": name, "harness_type": htype})
+            child_ports[f[1]] = ports
+        elif f[0] == "childmissing":
+            missing.append(f[1])
+    return parent, symbols, child_ports, missing
+
+
+def _compare_hierarchy(symbols, child_ports, missing):
+    findings, per_symbol = [], []
+    for sym in symbols:
+        child = sym["file_name"]
+        ports = child_ports.get(child)
+        row = {"sheet_symbol": sym["sheet_name"], "child": child,
+               "entries": len(sym["entries"]), "ports": None if ports is None else len(ports)}
+        if ports is None:
+            findings.append({"rule": "child_not_loaded", "severity": "info",
+                             "message": "child sheet %s is not in memory; compile the project to check it" % child,
+                             "child": child})
+            per_symbol.append(row)
+            continue
+        by_entry = {e["name"]: e for e in sym["entries"]}
+        by_port = {p["name"]: p for p in ports}
+        for name, e in sorted(by_entry.items()):
+            p = by_port.get(name)
+            if p is None:
+                findings.append({"rule": "entry_without_port", "severity": "error",
+                                 "message": "sheet entry %r on %s has no port of that name on %s"
+                                            % (name, sym["sheet_name"], child),
+                                 "child": child, "entry": name})
+            elif (p.get("harness_type") or "") != (e.get("harness_type") or ""):
+                findings.append({"rule": "harness_type_mismatch", "severity": "error",
+                                 "message": "%r: entry harness type %r, port harness type %r"
+                                            % (name, e.get("harness_type") or "", p.get("harness_type") or ""),
+                                 "child": child, "entry": name})
+        for name in sorted(set(by_port) - set(by_entry)):
+            findings.append({"rule": "port_without_entry", "severity": "error",
+                             "message": "port %r on %s has no sheet entry on %s"
+                                        % (name, child, sym["sheet_name"]),
+                             "child": child, "port": name})
+        row["matched"] = len(set(by_entry) & set(by_port))
+        per_symbol.append(row)
+    seen = {f.get("child") for f in findings if f["rule"] == "child_not_loaded"}
+    for m in missing:
+        if m not in seen:
+            findings.append({"rule": "child_not_loaded", "severity": "info",
+                             "message": "child sheet %s is not in memory" % m, "child": m})
+    return findings, per_symbol
+
+
+@_tool(read_only=True)
+async def check_hierarchy_live(ctx: Context, document: str, timeout_seconds: int = 180) -> str:
+    """
+    Compare every sheet symbol on a parent sheet with the PORTS of the child
+    sheet it stands for - the cross-sheet half of connectivity that a
+    single-sheet check cannot see.
+
+    Reports entries with no matching port, ports with no matching entry, and
+    name matches whose harness types disagree. Altium only complains about
+    these at compile time, and then indirectly ("conflicting harness
+    definition", "net has only one pin").
+
+    Read-only. A compiled project keeps every sheet in memory, so children are
+    read without opening tabs; children that are not loaded are reported as
+    such (compile the project, e.g. with check_erc, and run this again).
+
+    Args:
+        document (str): full path of the PARENT sheet (the one carrying the
+            sheet symbols).
+
+    Returns:
+        str: JSON with per-symbol counts, findings, and the raw entry/port
+             lists per sheet symbol.
+    """
+    doc = _canon(document)
+    payload, images = await _run_sandbox(_HIERARCHY_PAS.replace("__DOC__", _pas_str(doc)), timeout_seconds)
+    if not payload.get("success"):
+        return _sandbox_return(payload, images)
+    res = (payload.get("result") or "").strip()
+    if res.startswith("ABORT"):
+        return json.dumps({"success": False, "error": res}, indent=2)
+    parent, symbols, child_ports, missing = _parse_hierarchy(res)
+    findings, per_symbol = _compare_hierarchy(symbols, child_ports, missing)
+    counts = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    return json.dumps({"success": True, "parent": parent, "counts": counts,
+                       "sheet_symbols": per_symbol, "findings": findings,
+                       "entries": {s["sheet_name"]: s["entries"] for s in symbols},
+                       "child_ports": child_ports}, indent=2)
+
+
+@_tool()
+async def set_sheet_entries(ctx: Context, sheet_symbol: str, add: list = None, rename: list = None,
+                            delete: list = None, apply: bool = False, document: str = None,
+                            timeout_seconds: int = 180) -> str:
+    """
+    Add, edit and remove SHEET ENTRIES on one sheet symbol of a parent sheet -
+    the parent-side counterpart of a child sheet's ports.
+
+    An entry sits on the symbol's right edge (side 1) or left edge (side 0) at
+    `distance_from_top` below the symbol's top, and carries the same
+    harness_type as the child's port. Entry names must match the child's port
+    names exactly; check_hierarchy_live (or check_hierarchy on the saved files) reports the disagreements.
+
+    DEFAULTS TO A PREVIEW (apply=False). One call = one undo step.
+    Distances are internal units (1 mil = 10000).
+
+    Args:
+        sheet_symbol (str): the symbol's SheetName or SheetFileName.
+        add (list): [{"name": "SPI6", "distance_from_top": 15000000,
+            "side": 1, "io_type": 0, "harness_type": "SPI"}]
+        rename (list): [{"match": {"name": "SPI3"}, "name": "SPI6",
+            "harness_type": "SPI", "distance_from_top": ..., "side": ..., "io_type": ...}]
+        delete (list): entry names to remove.
+        apply (bool): False previews; True writes.
+        document (str): the PARENT sheet's path (open, not necessarily focused).
+
+    Returns:
+        str: JSON with the symbol found, what each change matches, warnings
+             (duplicate or unknown names), and when applied the counts.
+    """
+    add, rename, delete = add or [], rename or [], delete or []
+    if not add and not rename and not delete:
+        return json.dumps({"success": False, "error": "nothing to do"})
+    for a in add:
+        if not a.get("name") or a.get("distance_from_top") is None:
+            return json.dumps({"success": False, "error": "add entries need name and distance_from_top: %s" % (a,)})
+    doc, objs, err = await _sheet_state(["sheetsymbol"], timeout_seconds, document)
+    if err:
+        return err
+    syms = [o for o in objs if o["kind"] == "sheetsymbol"
+            and sheet_symbol in (o.get("name"), o.get("file_name"))]
+    if len(syms) != 1:
+        return json.dumps({"success": False, "document": doc,
+                           "error": "sheet symbol %r matches %d symbols on this sheet" % (sheet_symbol, len(syms)),
+                           "available": [{"name": o.get("name"), "file_name": o.get("file_name")}
+                                         for o in objs if o["kind"] == "sheetsymbol"]}, indent=2)
+    sym = syms[0]
+    names = {e["name"] for e in sym["entries"]}
+    taken = {e["distance_from_top"]: e["name"] for e in sym["entries"]}
+    warnings = []
+    for a in add:
+        if a["name"] in names:
+            warnings.append("entry %r already exists on this symbol" % a["name"])
+        other = taken.get(int(a["distance_from_top"]))
+        if other:
+            warnings.append("distance_from_top %d is already used by entry %r" % (int(a["distance_from_top"]), other))
+        if int(a["distance_from_top"]) > sym["y_size"]:
+            warnings.append("entry %r sits %d below the top, past the symbol's height %d"
+                            % (a["name"], int(a["distance_from_top"]), sym["y_size"]))
+    for r in rename:
+        want = (r.get("match") or {}).get("name")
+        if want not in names:
+            warnings.append("rename source %r is not an entry on this symbol" % want)
+        if r.get("name") and r["name"] in names and r["name"] != want:
+            warnings.append("rename target %r already exists" % r["name"])
+    for d in delete:
+        if d not in names:
+            warnings.append("delete target %r is not an entry on this symbol" % d)
+    plan = {"symbol": {"name": sym.get("name"), "file_name": sym.get("file_name"),
+                       "entries_now": len(sym["entries"])},
+            "adds": len(add), "renames": len(rename), "deletes": len(delete)}
+    if not apply:
+        return json.dumps({"success": True, "applied": False, "document": doc, "plan": plan,
+                           "warnings": warnings,
+                           "note": "preview only - call again with apply=true to write"}, indent=2)
+    script = _target_document(_set_sheet_entries_script(sheet_symbol, add, rename, delete), document)
+    return await _apply_script(script, plan, warnings, doc, ["renamed", "added", "deleted"], timeout_seconds)
 
 
 if __name__ == "__main__":
